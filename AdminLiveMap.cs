@@ -9,16 +9,17 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("Admin Live Map", "Guerisse", "1.1.0")]
+    [Info("Admin Live Map", "Guerisse", "1.2.0")]
     [Description("Feeds the Admin Live Map web page over RCON: players, trails, deaths, bases and the map image")]
     public class AdminLiveMap : RustPlugin
     {
         // The web page (LiveMap.html) connects to the server's WebRCON and calls these console commands:
-        //   livemap.players            online players (small, asked every 2 seconds)
+        //   livemap.players            online players and game events (small, asked every 2 seconds)
         //   livemap.sleepers           offline sleepers (asked only when they changed)
         //   livemap.deaths <afterId>   deaths newer than the given id
         //   livemap.trails [steamId]   where players walked recently (all players thinned out, or one in full)
         //   livemap.bases              tool cupboards and the size of their buildings
+        //   livemap.heat <layer> <period>   heatmap: activity, deaths or pvp; for the last hour, day or since the wipe
         //   livemap.mapdata            the map image (rendered once per map, then cached)
         // For people typing in the server console:
         //   livemap.map [rerender]     shows whether the map image is ready, or draws it again
@@ -163,6 +164,15 @@ namespace Oxide.Plugins
             [JsonProperty("Base scan time per step (milliseconds, 5 steps a second)")]
             public float ScanBudgetMs = 2f;
 
+            [JsonProperty("Collect heatmap data")]
+            public bool Heatmap = true;
+
+            [JsonProperty("Heatmap squares across the map (changing it starts the heatmap from zero)")]
+            public int HeatCells = 128;
+
+            [JsonProperty("Heatmap activity counts players standing still")]
+            public bool HeatCountIdle = false;
+
             public void Clamp()
             {
                 MapScale = Mathf.Clamp(MapScale, 0.1f, 2f);
@@ -174,6 +184,7 @@ namespace Oxide.Plugins
                 DeathMinutes = Mathf.Clamp(DeathMinutes, 0, 7 * 24 * 60);
                 MaxDeaths = Mathf.Clamp(MaxDeaths, 0, 10000);
                 ScanBudgetMs = Mathf.Clamp(ScanBudgetMs, 0.5f, 20f);
+                HeatCells = Mathf.Clamp(HeatCells, 32, 256);
             }
         }
 
@@ -209,13 +220,31 @@ namespace Oxide.Plugins
             foreach (var d in _deaths) if (d.id >= _nextDeathId) _nextDeathId = d.id + 1;
             PruneDeaths();
 
+            LoadHeat();
+            FindEvents();
+
             timer.Every(_config.TrailInterval, SampleTrails);
             SampleTrails();
         }
 
-        private void OnServerSave() => SaveDeaths();
+        private void OnServerSave()
+        {
+            SaveDeaths();
+            SaveHeat();
+        }
 
-        private void Unload() => SaveDeaths();
+        private void Unload()
+        {
+            SaveDeaths();
+            SaveHeat();
+        }
+
+        // A new save means a wipe: start the "since wipe" heatmap from zero.
+        private void OnNewSave(string filename)
+        {
+            _heat = null;
+            Interface.Oxide.DataFileSystem.WriteObject(HeatFile, new HeatData());
+        }
 
         #endregion
 
@@ -319,7 +348,8 @@ namespace Oxide.Plugins
             CollectOnline(_snaps, _teamLeaders, _seen);
             UpdateSleepersVersion();
             int sleeperCount = _config.SendSleepers ? Math.Max(0, CountSleepers()) : 0;
-            return WritePlayers(_snaps, _teamLeaders, _sleepersVersion, sleeperCount, _nextDeathId - 1);
+            CollectEvents(_eventSnaps);
+            return WritePlayers(_snaps, _teamLeaders, _sleepersVersion, sleeperCount, _nextDeathId - 1, _eventSnaps);
         }
 
         private void CollectOnline(List<PlayerSnap> into, Dictionary<ulong, ulong> leaders, HashSet<ulong> seen)
@@ -385,7 +415,7 @@ namespace Oxide.Plugins
             }
         }
 
-        private string WritePlayers(List<PlayerSnap> online, Dictionary<ulong, ulong> leaders, int sleepersVersion, int sleeperCount, int lastDeath)
+        private string WritePlayers(List<PlayerSnap> online, Dictionary<ulong, ulong> leaders, int sleepersVersion, int sleeperCount, int lastDeath, List<EventSnap> events)
         {
             float hour = TOD_Sky.Instance != null ? TOD_Sky.Instance.Cycle.Hour : -1f;
             var sb = _sb.Clear();
@@ -417,7 +447,9 @@ namespace Oxide.Plugins
                 sb.Append(','); Str(sb, s.Mounted);
                 sb.Append(']');
             }
-            sb.Append("]}");
+            sb.Append(']');
+            WriteEvents(sb, events);
+            sb.Append('}');
             return sb.ToString();
         }
 
@@ -507,13 +539,15 @@ namespace Oxide.Plugins
                 var pos = p.transform.position;
                 List<TrailPoint> trail;
                 if (!_trails.TryGetValue(p.userID, out trail)) _trails[p.userID] = trail = new List<TrailPoint>();
+                bool moved = true;
                 if (trail.Count > 0)
                 {
                     var last = trail[trail.Count - 1];
                     float dx = pos.x - last.X, dz = pos.z - last.Z;
-                    if (dx * dx + dz * dz < minMoveSq) continue;
+                    moved = dx * dx + dz * dz >= minMoveSq;
                 }
-                trail.Add(new TrailPoint { T = now, X = pos.x, Z = pos.z });
+                if (_config.Heatmap && (moved || _config.HeatCountIdle) && !p.IsSleeping()) HeatAdd(HeatActivity, pos.x, pos.z);
+                if (moved) trail.Add(new TrailPoint { T = now, X = pos.x, Z = pos.z });
             }
 
             _emptyTrails.Clear();
@@ -712,6 +746,11 @@ namespace Oxide.Plugins
                 _deaths.Add(rec);
                 PruneDeaths();
                 _playersReply.Json = null; // the next update tells the page there is a new death
+                if (_config.Heatmap)
+                {
+                    HeatAdd(HeatDeaths, pos.x, pos.z);
+                    if (rec.killerId != null) HeatAdd(HeatPvp, pos.x, pos.z);
+                }
             }
             catch (Exception e)
             {
@@ -943,6 +982,367 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Game events
+
+        // Patrol helicopter, Chinook, cargo ship, Bradley, cargo plane, supply drops, locked crates and the
+        // travelling vendor are noted when they spawn (and found once when the plugin loads). Deep Sea ghost
+        // ships, islands and floating cities come from the game's own lists. Each answer reads their positions.
+
+        private const float EventNewsMinutes = 30f;
+        private readonly HashSet<BaseEntity> _eventEnts = new HashSet<BaseEntity>();
+        private readonly List<BaseEntity> _eventGone = new List<BaseEntity>();
+        private readonly List<EventSnap> _eventSnaps = new List<EventSnap>();
+        private readonly List<EventNews> _news = new List<EventNews>();
+        private int _nextNewsId = 1;
+        private float _findEventsMs;
+
+        private struct EventSnap
+        {
+            public ulong Id;
+            public string Kind;
+            public float X, Z, Heading;
+            public int Value; // health % (helicopter, Bradley), seconds left (crate being hacked; 0 = open), or -1
+        }
+
+        private class EventNews
+        {
+            public int Id;
+            public long Time;
+            public string Kind, What, By; // e.g. "heli", "destroyed", player name
+            public float X, Z;
+            public string Grid;
+        }
+
+        private static string EventKind(BaseEntity e)
+        {
+            if (e is PatrolHelicopter) return "heli";
+            if (e is CH47HelicopterAIController) return "ch47";
+            if (e is CargoShip) return "cargo";
+            if (e is BradleyAPC) return "bradley";
+            if (e is CargoPlane) return "plane";
+            if (e is SupplyDrop) return "drop";
+            if (e is HackableLockedCrate) return "crate";
+            if (e is TravellingVendor) return "vendor";
+            return null;
+        }
+
+        private void FindEvents()
+        {
+            var sw = Stopwatch.StartNew();
+            foreach (var n in BaseNetworkable.serverEntities)
+            {
+                var e = n as BaseEntity;
+                if (e != null && EventKind(e) != null) _eventEnts.Add(e);
+            }
+            _findEventsMs = (float)sw.Elapsed.TotalMilliseconds;
+        }
+
+        private void TrackEvent(BaseEntity e)
+        {
+            if (e != null) _eventEnts.Add(e);
+        }
+
+        private void OnEntitySpawned(PatrolHelicopter e) => TrackEvent(e);
+        private void OnEntitySpawned(CH47HelicopterAIController e) => TrackEvent(e);
+        private void OnEntitySpawned(CargoShip e) => TrackEvent(e);
+        private void OnEntitySpawned(BradleyAPC e) => TrackEvent(e);
+        private void OnEntitySpawned(CargoPlane e) => TrackEvent(e);
+        private void OnEntitySpawned(SupplyDrop e) => TrackEvent(e);
+        private void OnEntitySpawned(HackableLockedCrate e) => TrackEvent(e);
+        private void OnEntitySpawned(TravellingVendor e) => TrackEvent(e);
+
+        private void OnEntityDeath(PatrolHelicopter e, HitInfo info) => AddNews(e, "heli", "destroyed", info);
+        private void OnEntityDeath(BradleyAPC e, HitInfo info) => AddNews(e, "bradley", "destroyed", info);
+
+        private void AddNews(BaseEntity e, string kind, string what, HitInfo info)
+        {
+            if (e == null) return;
+            var pos = e.transform.position;
+            var by = info?.InitiatorPlayer;
+            _news.Add(new EventNews
+            {
+                Id = _nextNewsId++, Time = Now(), Kind = kind, What = what,
+                By = by != null && !by.IsNpc && by.userID.IsSteamId() ? by.displayName : null,
+                X = pos.x, Z = pos.z, Grid = MapHelper.PositionToString(pos)
+            });
+            _playersReply.Json = null;
+        }
+
+        private void CollectEvents(List<EventSnap> into)
+        {
+            into.Clear();
+            _eventGone.Clear();
+            foreach (var e in _eventEnts)
+            {
+                if (e == null || e.IsDestroyed) { _eventGone.Add(e); continue; }
+                string kind = EventKind(e);
+                int value = -1;
+                var combat = e as BaseCombatEntity;
+                if ((kind == "heli" || kind == "bradley") && combat != null && combat.MaxHealth() > 0f)
+                    value = Mathf.Clamp(Mathf.RoundToInt(combat.health / combat.MaxHealth() * 100f), 0, 100);
+                var crate = e as HackableLockedCrate;
+                if (crate != null)
+                {
+                    if (crate.IsFullyHacked()) value = 0;
+                    else if (crate.IsBeingHacked()) value = Mathf.Max(1, Mathf.CeilToInt(HackableLockedCrate.requiredHackSeconds - crate.hackSeconds));
+                }
+                AddSnap(into, e, kind, value);
+            }
+            foreach (var e in _eventGone) _eventEnts.Remove(e);
+
+            AddDeepSea(into, DeepSeaManager.ServerGhostShips, "ghostship");
+            AddDeepSea(into, DeepSeaManager.ServerIslands, "island");
+            AddDeepSea(into, DeepSeaManager.ServerFloatingCities, "city");
+
+            long cutoff = Now() - (long)(EventNewsMinutes * 60);
+            int old = 0;
+            while (old < _news.Count && _news[old].Time < cutoff) old++;
+            if (old > 0) _news.RemoveRange(0, old);
+        }
+
+        private static void AddSnap(List<EventSnap> into, BaseEntity e, string kind, int value)
+        {
+            var pos = e.transform.position;
+            into.Add(new EventSnap
+            {
+                Id = e.net != null ? e.net.ID.Value : 0,
+                Kind = kind, X = pos.x, Z = pos.z,
+                Heading = e.transform.eulerAngles.y,
+                Value = value
+            });
+        }
+
+        private static void AddDeepSea<T>(List<EventSnap> into, IEnumerable<T> list, string kind) where T : BaseEntity
+        {
+            if (list == null) return;
+            foreach (var e in list)
+                if (e != null && !e.IsDestroyed) AddSnap(into, e, kind, -1);
+        }
+
+        private void WriteEvents(StringBuilder sb, List<EventSnap> events)
+        {
+            // Each event: [entityId, kind, x, z, heading, value]
+            sb.Append(",\"events\":[");
+            for (int i = 0; i < events.Count; i++)
+            {
+                var s = events[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("[\"").Append(s.Id.ToString(Inv)).Append("\",");
+                Str(sb, s.Kind);
+                sb.Append(','); Int(sb, s.X);
+                sb.Append(','); Int(sb, s.Z);
+                sb.Append(','); Int(sb, s.Heading);
+                sb.Append(','); Int(sb, s.Value);
+                sb.Append(']');
+            }
+            // Recent news: [id, time, kind, what, byPlayer, x, z, grid]
+            sb.Append("],\"news\":[");
+            for (int i = 0; i < _news.Count; i++)
+            {
+                var n = _news[i];
+                if (i > 0) sb.Append(',');
+                sb.Append('['); Int(sb, n.Id);
+                sb.Append(','); Int(sb, n.Time);
+                sb.Append(','); Str(sb, n.Kind);
+                sb.Append(','); Str(sb, n.What);
+                sb.Append(','); Str(sb, n.By);
+                sb.Append(','); Int(sb, n.X);
+                sb.Append(','); Int(sb, n.Z);
+                sb.Append(','); Str(sb, n.Grid);
+                sb.Append(']');
+            }
+            sb.Append(']');
+        }
+
+        #endregion
+
+        #region Heatmap
+
+        // Three counters per map square: where players moved (sampled with the trails, every few seconds),
+        // where players died, and where players were killed by another player. Each is kept three ways:
+        // ten-minute buckets for the last hour (memory only), hourly buckets for the last 24 hours, and a
+        // total since the wipe (both saved with the server). Empty squares take no space.
+
+        private const string HeatFile = "AdminLiveMap/heatmap";
+        private const string HeatActivity = "activity", HeatDeaths = "deaths", HeatPvp = "pvp";
+        private const float HeatCacheSeconds = 60f;
+        private HeatData _heat;
+        private bool _heatDirty;
+        private readonly Dictionary<string, CachedReply> _heatReplies = new Dictionary<string, CachedReply>();
+
+        private class HeatLayer
+        {
+            public Dictionary<int, int> Total = new Dictionary<int, int>();
+            public Dictionary<int, int>[] Hours = new Dictionary<int, int>[24]; // slot = hour number % 24
+            public long[] HourOf = new long[24];
+            [JsonIgnore] public Dictionary<int, int>[] Tens = new Dictionary<int, int>[6]; // last hour, 10-minute slots
+            [JsonIgnore] public long[] TenOf = new long[6];
+        }
+
+        private class HeatData
+        {
+            public string Key = "";
+            public Dictionary<string, HeatLayer> Layers = new Dictionary<string, HeatLayer>();
+        }
+
+        private string HeatKey() => $"{(int)World.Size}_{World.Seed}_{_config.HeatCells}";
+
+        private void LoadHeat()
+        {
+            try { _heat = Interface.Oxide.DataFileSystem.ReadObject<HeatData>(HeatFile); }
+            catch { _heat = null; }
+            if (_heat == null || _heat.Key != HeatKey() || _heat.Layers == null)
+                _heat = new HeatData { Key = HeatKey() };
+            foreach (var layer in _heat.Layers.Values)
+            {
+                if (layer.Total == null) layer.Total = new Dictionary<int, int>();
+                if (layer.Hours == null || layer.Hours.Length != 24) layer.Hours = new Dictionary<int, int>[24];
+                if (layer.HourOf == null || layer.HourOf.Length != 24) layer.HourOf = new long[24];
+            }
+        }
+
+        private void SaveHeat()
+        {
+            if (_heat == null || !_heatDirty) return;
+            Interface.Oxide.DataFileSystem.WriteObject(HeatFile, _heat);
+            _heatDirty = false;
+        }
+
+        private HeatLayer Layer(string name)
+        {
+            if (_heat == null) _heat = new HeatData { Key = HeatKey() };
+            HeatLayer layer;
+            if (!_heat.Layers.TryGetValue(name, out layer)) _heat.Layers[name] = layer = new HeatLayer();
+            return layer;
+        }
+
+        private int HeatIndex(float x, float z)
+        {
+            float size = World.Size, half = size / 2f;
+            int n = _config.HeatCells;
+            int cx = (int)((x + half) / size * n), cz = (int)((half - z) / size * n);
+            if (x < -half || z > half || cx >= n || cz >= n) return -1; // outside the map
+            return cz * n + cx;
+        }
+
+        private static void Inc(Dictionary<int, int> d, int idx)
+        {
+            int v;
+            d.TryGetValue(idx, out v);
+            d[idx] = v + 1;
+        }
+
+        private void HeatAdd(string name, float x, float z)
+        {
+            int idx = HeatIndex(x, z);
+            if (idx < 0) return;
+            var layer = Layer(name);
+            long now = Now(), hour = now / 3600, ten = now / 600;
+
+            Inc(layer.Total, idx);
+
+            int h = (int)(hour % 24);
+            if (layer.Hours[h] == null || layer.HourOf[h] != hour)
+            {
+                if (layer.Hours[h] == null) layer.Hours[h] = new Dictionary<int, int>(); else layer.Hours[h].Clear();
+                layer.HourOf[h] = hour;
+            }
+            Inc(layer.Hours[h], idx);
+
+            int t = (int)(ten % 6);
+            if (layer.Tens[t] == null || layer.TenOf[t] != ten)
+            {
+                if (layer.Tens[t] == null) layer.Tens[t] = new Dictionary<int, int>(); else layer.Tens[t].Clear();
+                layer.TenOf[t] = ten;
+            }
+            Inc(layer.Tens[t], idx);
+            _heatDirty = true;
+        }
+
+        private Dictionary<int, int> HeatQuery(string name, string period)
+        {
+            var layer = Layer(name);
+            if (period == "wipe") return layer.Total;
+            var sum = new Dictionary<int, int>();
+            long now = Now();
+            Dictionary<int, int>[] slots = period == "hour" ? layer.Tens : layer.Hours;
+            long[] of = period == "hour" ? layer.TenOf : layer.HourOf;
+            long current = period == "hour" ? now / 600 : now / 3600;
+            int count = slots.Length;
+            for (int i = 0; i < count; i++)
+            {
+                if (slots[i] == null || of[i] <= current - count) continue; // older than the period
+                foreach (var kv in slots[i])
+                {
+                    int v;
+                    sum.TryGetValue(kv.Key, out v);
+                    sum[kv.Key] = v + kv.Value;
+                }
+            }
+            return sum;
+        }
+
+        [ConsoleCommand("livemap.heat")]
+        private void CmdHeat(ConsoleSystem.Arg arg)
+        {
+            if (!FromConsoleOrRcon(arg)) return;
+            string name = arg.GetString(0, HeatActivity).ToLowerInvariant();
+            string period = arg.GetString(1, "day").ToLowerInvariant();
+            if (name != HeatActivity && name != HeatDeaths && name != HeatPvp) name = HeatActivity;
+            if (period != "hour" && period != "day" && period != "wipe") period = "day";
+
+            if (!_config.Heatmap)
+            {
+                arg.ReplyWith("{\"type\":\"heat\",\"disabled\":true,\"layer\":\"" + name + "\",\"period\":\"" + period + "\",\"data\":[]}");
+                return;
+            }
+
+            if (!arg.IsRcon)
+            {
+                // Typed in the server console: a readable summary
+                var cells = HeatQuery(name, period);
+                long total = 0;
+                foreach (var v in cells.Values) total += v;
+                arg.ReplyWith($"Heatmap {name}, {period}: {total} count(s) in {cells.Count} square(s).");
+                return;
+            }
+
+            string key = name + "_" + period;
+            CachedReply cached;
+            if (!_heatReplies.TryGetValue(key, out cached)) _heatReplies[key] = cached = new CachedReply();
+            if (!cached.Fresh(HeatCacheSeconds)) cached.Set(WriteHeat(name, period, HeatQuery(name, period)));
+            arg.ReplyWith(cached.Json);
+        }
+
+        private string WriteHeat(string name, string period, Dictionary<int, int> cells)
+        {
+            int max = 0;
+            long total = 0;
+            foreach (var v in cells.Values) { total += v; if (v > max) max = v; }
+            var sb = _sb.Clear();
+            sb.Append("{\"type\":\"heat\",\"layer\":"); Str(sb, name);
+            sb.Append(",\"period\":"); Str(sb, period);
+            sb.Append(",\"cells\":"); Int(sb, _config.HeatCells);
+            sb.Append(",\"size\":"); Int(sb, (long)World.Size);
+            sb.Append(",\"interval\":"); Num(sb, _config.TrailInterval);
+            sb.Append(",\"countsIdle\":").Append(_config.HeatCountIdle ? "true" : "false");
+            sb.Append(",\"max\":"); Int(sb, max);
+            sb.Append(",\"total\":"); Int(sb, total);
+            // Squares that have a count: [squareIndex, count, squareIndex, count, ...]; index = row * cells + column, row 0 = north
+            sb.Append(",\"data\":[");
+            bool first = true;
+            foreach (var kv in cells)
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                Int(sb, kv.Key); sb.Append(','); Int(sb, kv.Value);
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        #endregion
+
         #region Load test
 
         [ConsoleCommand("livemap.benchmark")]
@@ -1010,7 +1410,11 @@ namespace Oxide.Plugins
             report.AppendLine($"Admin Live Map load test with made-up data: {online} online, {sleepers} sleepers, {bases} bases, " +
                               $"{trailPoints} trail points ({online} players walking for {_config.TrailMinutes} minutes).");
             report.AppendLine("Time = server time to build one answer. Answers are shared by all open pages for the time shown.");
-            Bench(report, "Online players (asked every 2 s, shared for 1 s)", () => WritePlayers(onlineSnaps, leaders, 1, sleepers, 0));
+            var fakeEvents = new List<EventSnap>();
+            string[] kinds = { "heli", "ch47", "cargo", "bradley", "plane", "drop", "crate", "vendor" };
+            for (int i = 0; i < 16; i++)
+                fakeEvents.Add(new EventSnap { Id = 1000UL + (ulong)i, Kind = kinds[i % kinds.Length], X = pos(), Z = pos(), Heading = rnd.Next(360), Value = -1 });
+            Bench(report, "Online players and game events (asked every 2 s, shared for 1 s)", () => WritePlayers(onlineSnaps, leaders, 1, sleepers, 0, fakeEvents));
             Bench(report, "Sleepers (asked only when someone falls asleep or wakes up, at most every 60 s)", () => WriteSleepers(sleeperSnaps, leaders, 1));
             Bench(report, $"All trails (once when the page connects, thinned to {_config.MaxTrailPoints} points)", () => WriteTrails(trails, _config.MaxTrailPoints));
             Bench(report, "One player's full trail (when you click a player)", () =>
@@ -1020,6 +1424,10 @@ namespace Oxide.Plugins
                 return sb.ToString();
             });
             Bench(report, "Bases (asked every 60 s, shared for 30 s)", () => WriteBases(baseSnaps, true, bases, bases, fakeName));
+            var fakeHeat = new Dictionary<int, int>();
+            int heatCells = _config.HeatCells * _config.HeatCells;
+            for (int i = 0; i < heatCells; i++) if (rnd.Next(10) < 4) fakeHeat[i] = rnd.Next(1, 5000);
+            Bench(report, "Heatmap (only while switched on in the page, at most once a minute)", () => WriteHeat(HeatActivity, "day", fakeHeat));
             report.AppendLine($"Trail memory for this many points: about {trailPoints * 12 / 1024 / 1024f:0.0} MB.");
 
             // The real server, right now
@@ -1029,6 +1437,7 @@ namespace Oxide.Plugins
             double playersMs = swReal.Elapsed.TotalMilliseconds;
             int realPoints = 0;
             foreach (var t in _trails.Values) realPoints += t.Count;
+            report.AppendLine($"Game events: {_eventEnts.Count} tracked now; finding them when the plugin loaded took {_findEventsMs:0.0} ms (once).");
             report.AppendLine($"This server now: {_snaps.Count} online, {Math.Max(0, CountSleepers())} sleepers, {realPoints} trail points. " +
                               $"Online players answer: {playersMs:0.00} ms, {players.Length / 1024f:0.0} KB. Trail sampling: {_sampleMs:0.00} ms every {_config.TrailInterval:0.#} s.");
             if (_scanTicks > 0)
@@ -1037,6 +1446,13 @@ namespace Oxide.Plugins
                                   $"{_scanMsTotal / _scanTicks:0.00} ms per step on average (max {_scanMsMax:0.00} ms, limit {_config.ScanBudgetMs:0.#} ms, 5 steps a second).");
             else
                 report.AppendLine("Base measuring has not run yet. It starts when the page asks for bases.");
+            if (_config.Heatmap)
+            {
+                var swHeat = Stopwatch.StartNew();
+                var day = HeatQuery(HeatActivity, "day");
+                string heatJson = WriteHeat(HeatActivity, "day", day);
+                report.AppendLine($"Heatmap: {Layer(HeatActivity).Total.Count} squares with activity since the wipe; the 24-hour activity answer takes {swHeat.Elapsed.TotalMilliseconds:0.00} ms, {heatJson.Length / 1024f:0.0} KB.");
+            }
 
             arg.ReplyWith(report.ToString().TrimEnd());
         }

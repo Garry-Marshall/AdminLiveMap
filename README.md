@@ -16,11 +16,12 @@ You don't need a web server, a database or any other program. The page talks to 
 - **Trails** showing where players walked in the last 10, 30 or 60 minutes. The server keeps the history, so trails are there even if the page was closed.
 - **Death markers** showing who died where, killed by whom or what, with which weapon and from how far.
 - **Bases**: every building with a tool cupboard, its owner, its size and who has cupboard access.
+- **Game events**: the patrol helicopter and Bradley (with health), Chinook, cargo ship, cargo plane, supply drops, locked crates (with a hacking countdown), the travelling vendor, and Deep Sea ghost ships, islands and floating cities. Alerts when they arrive or leave, when the heli or Bradley is destroyed (and by whom), and when someone starts hacking a crate.
+- **Heatmap** of where players move around, where they die, or where they are killed by other players, for the last hour, the last 24 hours or since the wipe.
 - **Live chat**, including team chat, with a box to reply to everyone as SERVER.
 - **Join, leave and death alerts** with pop-ups and optional sounds, plus an events list where a click jumps to the spot on the map.
 - **Server health**: FPS, entity count, memory use and uptime.
 - **Follow a player**: click a name and the map keeps them centred. A search box finds anyone by name or Steam ID.
-- **Built for big servers**: tested with 600 online players, 10,000 sleepers and 10,000 bases. See [Big servers](#big-servers).
 
 ## Requirements
 
@@ -36,7 +37,7 @@ You don't need a web server, a database or any other program. The page talks to 
 Copy `AdminLiveMap.cs` to your server's `oxide/plugins` folder. Oxide loads it automatically. Your server console should show:
 
 ```
-Loaded plugin Admin Live Map v1.1.0 by Guerisse
+Loaded plugin Admin Live Map v1.2.0 by Guerisse
 ```
 
 ### 2. Get the page
@@ -68,7 +69,8 @@ Tick **Remember on this computer** to skip typing the password next time. It is 
 | Show the whole map | The square button |
 | Follow a player | Click them in the player list. Click again to stop following. |
 | See details | Hover over the map: grid square, plus any base or death marker under the mouse |
-| Show or hide layers | The tick boxes: grid, monuments, sleepers, names, trails, deaths, bases, sounds |
+| Show or hide layers | The tick boxes: grid, monuments, sleepers, names, trails, deaths, bases, game events, sounds, heatmap |
+| Heatmap | Tick **Heatmap**, then choose **Activity**, **All deaths** or **PvP kills**, and **Last hour**, **Last 24 hours** or **Since wipe**. Hover for the numbers; the key at the bottom left explains the colours. |
 | Jump to an event | Click a line in the **Events** tab |
 
 | Marker | Meaning |
@@ -78,6 +80,7 @@ Tick **Remember on this computer** to skip typing the password next time. It is 
 | Red X | Dead |
 | Skull | Where someone died in the last hour |
 | Box with a small square | A base. The square is the tool cupboard. Grey dashed boxes have no player owner (for example event bases). |
+| Round icon with a coloured ring | A game event: 🚁 patrol helicopter (red ring) or Chinook (yellow ring), 🚢 cargo ship, tank = Bradley, ✈ cargo plane, 🪂 supply drop, 🔒 locked crate (⏳ being hacked, 🔓 open), 🛒 travelling vendor, 👻 ghost ship, 🏝 Deep Sea island, 🏙 floating city. The small arrow on the ring shows where it is heading. |
 
 ## Console commands
 
@@ -97,12 +100,13 @@ These answer with JSON. You can send them over RCON yourself, for example to bui
 
 | Command | Answers with |
 | --- | --- |
-| `livemap.players` | Online players, plus counters that tell the page when sleepers or deaths changed |
+| `livemap.players` | Online players and game events (helicopters, cargo ship, Bradley, airdrops, locked crates, vendor, Deep Sea), plus counters that tell the page when sleepers or deaths changed |
 | `livemap.sleepers` | Offline sleepers |
 | `livemap.deaths <id>` | Deaths newer than the given death number (`0` for all) |
 | `livemap.trails` | Recent movement of all players, thinned out on busy servers. Typed in the server console, it prints a short summary instead. |
 | `livemap.trails <steamid>` | One player's full trail |
 | `livemap.bases` | Tool cupboards, their owners, building sizes and who has access |
+| `livemap.heat <activity\|deaths\|pvp> <hour\|day\|wipe>` | Heatmap counts per map square. Typed in the server console, it prints a short summary instead. |
 | `livemap.mapdata` | The map image (about 1 MB of text) and monument names |
 
 The page also uses three built-in Rust commands: `serverinfo`, `chat.tail` and `say`.
@@ -123,7 +127,10 @@ The settings file is `oxide/config/AdminLiveMap.json`:
   "Max deaths kept": 500,
   "Send sleepers to the page": true,
   "Send bases to the page": true,
-  "Base scan time per step (milliseconds, 5 steps a second)": 2.0
+  "Base scan time per step (milliseconds, 5 steps a second)": 2.0,
+  "Collect heatmap data": true,
+  "Heatmap squares across the map (changing it starts the heatmap from zero)": 128,
+  "Heatmap activity counts players standing still": false
 }
 ```
 
@@ -132,6 +139,7 @@ The settings file is `oxide/config/AdminLiveMap.json`:
 - **Deaths:** are saved in `oxide/data/AdminLiveMap/deaths.json`, so they survive a restart. Only the newest ones are kept, up to the maximum.
 - **Send sleepers / Send bases:** set to `false` to switch those layers off completely.
 - **Base scan time per step:** how long the plugin may spend measuring building sizes, five times a second. Lower is gentler on the server; a full pass then takes longer.
+- **Heatmap:** activity is counted at each trail point interval, deaths when they happen. The last 24 hours and the totals since the wipe are saved in `oxide/data/AdminLiveMap/heatmap.json` and start from zero after a wipe; the last hour is kept in memory only. 128 squares across means about 33 m per square on a 4250 map. With "counts players standing still" off, AFK players and people inside their base don't make the map light up.
 - **Map image:** is cached in `oxide/data/AdminLiveMap/map.json` (about 1 MB) and replaced automatically when the map changes.
 
 Reload the plugin after changing the file.
@@ -140,8 +148,9 @@ Reload the plugin after changing the file.
 
 The plugin and the page are built so the work grows gently with server size.
 
-- **Only what changed:** every 2 seconds the page asks for online players only. Sleepers are sent when someone falls asleep or wakes up (at most once a minute per page), and deaths only when there is a new one.
+- **Only what changed:** every 2 seconds the page asks for online players only. All sleepers are sent when the page connects. After that, the page only asks for the list again when it changed (someone fell asleep, woke up or died), at most once a minute; in between it moves players who log off or on itself. Deaths are only sent when there is a new one.
 - **Shared answers:** answers are kept for a short time and shared, so several open pages cost about the same as one.
+- **Game events cost almost nothing:** the plugin looks for them once when it loads (about 10 ms) and then only notes new helicopters, ships, crates and so on as the game spawns them. The Deep Sea is read from the game's own lists.
 - **No pauses for bases:** building sizes are measured a few buildings at a time (2 ms, five times a second) and only while a page is open. On a huge server the first pass can take a few minutes; until then bases show as a box around the cupboard and the footer says "measuring bases ..%".
 - **Busy-server mode in the page:** with more than 30 players online, joins, leaves, deaths and chat no longer pop up or beep (they are still listed). With more than 50, only the selected player's trail is drawn; with more than 60, names appear when you zoom in. Thousands of sleepers and bases are drawn as small squares when zoomed out.
 
@@ -149,10 +158,11 @@ Load test results on a test server (`livemap.benchmark`, made-up data, server ti
 
 | Answer | How often | 600 online, 10,000 sleepers, 10,000 bases | 250 online, 3,000 sleepers, 3,000 bases |
 | --- | --- | --- | --- |
-| Online players | every 2 s (shared for 1 s) | 1.2 ms, 50 KB | 0.5 ms, 21 KB |
+| Online players and game events | every 2 s (shared for 1 s) | 1.2 ms, 51 KB | 0.5 ms, 21 KB |
 | Sleepers | when changed, at most once a minute | 7.5 ms, 569 KB | 2.1 ms, 170 KB |
 | All trails | once when the page connects | 8.3 ms, 430 KB | 7.6 ms, 418 KB |
 | Bases | every 60 s (shared for 30 s) | 22.5 ms, 1.4 MB | 6.4 ms, 441 KB |
+| Heatmap (whole 128 × 128 grid in use) | once a minute, only while switched on | 5.5 ms, 64 KB | same |
 
 Run `livemap.benchmark` on your own server to see its numbers.
 

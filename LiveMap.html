@@ -71,7 +71,7 @@
   .ev { cursor: default; }
   .ev.click { cursor: pointer; } .ev.click:hover { background: var(--panel2); }
   .ev .ic { display: inline-block; width: 16px; text-align: center; margin-right: 4px; }
-  .ev.join .ic { color: var(--good); } .ev.leave .ic { color: var(--muted); } .ev.death .ic { color: var(--bad); }
+  .ev.join .ic { color: var(--good); } .ev.leave .ic { color: var(--muted); } .ev.death .ic { color: var(--bad); } .ev.game .ic { color: var(--accent); }
   #chatForm { display: none; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
   #chatForm.on { display: flex; }
   #chatForm input { flex: 1; }
@@ -89,11 +89,19 @@
   .toast { background: rgba(20,23,26,.92); border-left: 3px solid var(--accent); padding: 7px 11px; border-radius: 5px;
     font-size: 13px; transition: opacity .5s; }
   .toast.join { border-color: var(--good); } .toast.leave { border-color: var(--muted); }
-  .toast.death { border-color: var(--bad); } .toast.chat { border-color: #4fc3f7; }
+  .toast.death { border-color: var(--bad); } .toast.chat { border-color: #4fc3f7; } .toast.game { border-color: var(--accent); }
   #search { position: sticky; top: 0; z-index: 1; margin-bottom: 4px; }
   #listNote, #busyNote { color: var(--muted); font-size: 12px; padding: 2px 4px; }
   #listNote:empty, #busyNote:empty { display: none; }
   #busyNote { padding: 6px 0 0; }
+  .heatRow { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+  .heatRow .check { margin: 0; }
+  #heatKey { position: absolute; left: 12px; bottom: 12px; background: rgba(20,23,26,.9); padding: 7px 10px; border-radius: 6px;
+    font-size: 12px; color: var(--text); pointer-events: none; display: none; min-width: 210px; }
+  #heatKey.on { display: block; }
+  #heatKey .bar { height: 9px; border-radius: 3px; margin: 5px 0 2px;
+    background: linear-gradient(to right, rgba(40,60,255,.35), #2aa8ff, #33d17a, #ffd23f, #ff5a36); }
+  #heatKey .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -108,6 +116,7 @@
     </div>
     <div id="msg">Fill in the server details on the right and press Connect.</div>
     <div id="hover"></div>
+    <div id="heatKey"></div>
   </div>
 
   <aside id="side">
@@ -148,7 +157,17 @@
           </select></label>
         <label class="check"><input type="checkbox" id="tDeaths" checked> Deaths</label>
         <label class="check"><input type="checkbox" id="tBases" checked> Bases</label>
+        <label class="check" title="Patrol helicopter, Chinook, cargo ship, Bradley, airdrops, locked crates, travelling vendor, Deep Sea"><input type="checkbox" id="tGame" checked> Game events</label>
         <label class="check"><input type="checkbox" id="tSound" checked> Sounds</label>
+      </div>
+      <div class="heatRow">
+        <label class="check"><input type="checkbox" id="tHeat"> Heatmap</label>
+        <select id="heatLayer" title="What the heatmap shows">
+          <option value="activity">Activity</option><option value="deaths">All deaths</option><option value="pvp">PvP kills</option>
+        </select>
+        <select id="heatPeriod" title="Which time the heatmap covers">
+          <option value="hour">Last hour</option><option value="day" selected>Last 24 hours</option><option value="wipe">Since wipe</option>
+        </select>
       </div>
       <div id="busyNote"></div>
     </section>
@@ -186,10 +205,11 @@
   const LIST_MAX = 100;            // player list rows shown at once
   const GRID_CELL = 1024 / 7;
   const ID = { map: 7001, players: 7002, trails: 7003, bases: 7004, info: 7005, chatTail: 7006, say: 7007,
-    sleepers: 7008, deaths: 7009, trail: 7010 };
+    sleepers: 7008, deaths: 7009, trail: 7010, heat: 7011 };
+  const HEAT_MS = 60000;            // the server shares a heatmap answer for a minute
   const TEAM_COLORS = ['#4fc3f7', '#f06292', '#aed581', '#ffb74d', '#ba68c8', '#4db6ac', '#fff176', '#90a4ae', '#ff8a65', '#7986cb'];
   const DEATH_SHOW_SECONDS = 60 * 60;
-  const TOGGLES = ['tGrid', 'tMon', 'tSleep', 'tNames', 'tTrails', 'tDeaths', 'tBases', 'tSound'];
+  const TOGGLES = ['tGrid', 'tMon', 'tSleep', 'tNames', 'tTrails', 'tDeaths', 'tBases', 'tSound', 'tHeat', 'tGame'];
 
   const $ = id => document.getElementById(id);
   const cv = $('cv'), ctx = cv.getContext('2d'), wrap = $('mapWrap');
@@ -213,6 +233,8 @@
   let trailKeepSec = 3600, trailStep = 1, fullTrails = new Set();
   let deaths = [], lastDeath = 0, deathsPending = false, deathsLoaded = false;
   let bases = [], basesByOwner = new Map(), basesComplete = true, basesProgress = '';
+  let gameEvents = new Map(), seenNews = new Set(); // id -> {data, fromX, fromZ, toX, toZ, t0, got}
+  let heat = null, heatCanvas = null; // last heatmap answer, and its picture (one pixel per square)
   let chat = [], events = [];
   let activePane = 'players', unread = { chat: 0, events: 0 };
   let selected = null, follow = false;
@@ -227,10 +249,12 @@
     if (saved.port) $('port').value = saved.port;
     if (saved.pw) { $('pw').value = saved.pw; $('remember').checked = true; }
     if (saved.trailLen) $('trailLen').value = saved.trailLen;
+    if (saved.heatLayer) $('heatLayer').value = saved.heatLayer;
+    if (saved.heatPeriod) $('heatPeriod').value = saved.heatPeriod;
     for (const k of TOGGLES) if (k in saved) $(k).checked = saved[k];
   } catch (e) {}
   function saveSettings() {
-    const s = { host: $('host').value.trim(), port: $('port').value, trailLen: $('trailLen').value };
+    const s = { host: $('host').value.trim(), port: $('port').value, trailLen: $('trailLen').value, heatLayer: $('heatLayer').value, heatPeriod: $('heatPeriod').value };
     if ($('remember').checked) s.pw = $('pw').value;
     for (const k of TOGGLES) s[k] = $(k).checked;
     localStorage.setItem('rustLiveMap', JSON.stringify(s));
@@ -267,9 +291,9 @@
       send('chat.tail 50', ID.chatTail);
       const poll = () => send('livemap.players', ID.players);
       const info = () => send('serverinfo', ID.info);
-      poll(); info(); askBases();
+      poll(); info(); askBases(); askHeat();
       stopTimers();
-      timers.push(setInterval(poll, POLL_MS), setInterval(info, INFO_MS), setInterval(askBases, BASES_MS));
+      timers.push(setInterval(poll, POLL_MS), setInterval(info, INFO_MS), setInterval(askBases, BASES_MS), setInterval(askHeat, HEAT_MS));
     };
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -288,6 +312,7 @@
         case ID.deaths: if (d.type === 'deaths') loadDeaths(d); break;
         case ID.trails: case ID.trail: if (d.type === 'trails' || d.type === 'trail') loadTrails(d); break;
         case ID.bases: if (d.type === 'bases') loadBases(d); break;
+        case ID.heat: if (d.type === 'heat') loadHeat(d); break;
         case ID.info: updateHealth(d); break;
         case ID.chatTail: if (Array.isArray(d)) { chat = []; d.forEach(c => addChat(c, false)); chatDirty = true; } break;
       }
@@ -318,6 +343,7 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ Identifier: id, Message: cmd, Name: 'LiveMap' }));
   }
   function askBases() { if ($('tBases').checked) send('livemap.bases', ID.bases); }
+  function askHeat() { if ($('tHeat').checked) send('livemap.heat ' + $('heatLayer').value + ' ' + $('heatPeriod').value, ID.heat); }
   $('connectBtn').onclick = connect;
   $('discBtn').onclick = disconnect;
   $('pw').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
@@ -429,7 +455,7 @@
     if (!$('tSound').checked) return;
     try {
       audio = audio || new (window.AudioContext || window.webkitAudioContext)();
-      const notes = { join: [523, 784], leave: [523, 392], death: [196, 147], chat: [880] }[kind] || [660];
+      const notes = { join: [523, 784], leave: [523, 392], death: [196, 147], chat: [880], game: [392, 523, 659] }[kind] || [660];
       let t = audio.currentTime;
       for (const f of notes) {
         const o = audio.createOscillator(), gn = audio.createGain();
@@ -451,14 +477,14 @@
     setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 600); }, 6000);
   }
   // isNew: it happened while the page was open. On busy servers it is listed without a pop-up or sound.
-  function addEvent(kind, text, time, pos, isNew) {
-    const e = { kind, text, time, pos };
+  function addEvent(kind, text, time, pos, isNew, icon) {
+    const e = { kind, text, time, pos, icon };
     let i = events.length;
     while (i > 0 && events[i - 1].time > time) i--;
     events.splice(i, 0, e);
     if (events.length > 300) events.shift();
     if (isNew) {
-      if (!quiet) { toast(kind, text); beep(kind); }
+      if (!quiet || kind === 'game') { toast(kind, text); beep(kind); }
       if (activePane !== 'events') unread.events++;
     }
     eventsDirty = true;
@@ -478,7 +504,7 @@
       el.className = 'ev ' + e.kind + (e.pos ? ' click' : '');
       el.innerHTML = '<span class="t"></span><span class="ic"></span><span class="tx"></span>';
       el.querySelector('.t').textContent = clock(e.time);
-      el.querySelector('.ic').textContent = icons[e.kind] || '•';
+      el.querySelector('.ic').textContent = e.icon || icons[e.kind] || '•';
       el.querySelector('.tx').textContent = e.text;
       if (e.pos) { el.title = 'Show on map'; el.onclick = () => { follow = false; centerOnWorld(e.pos[0], e.pos[1], true); }; }
       frag.appendChild(el);
@@ -592,6 +618,7 @@
     }
     if (d.lastDeath < lastDeath) { lastDeath = 0; deaths = []; staticDirty = true; } // the server's death list was reset
     if (d.lastDeath > lastDeath && !deathsPending) { deathsPending = true; send('livemap.deaths ' + lastDeath, ID.deaths); }
+    updateGameEvents(d, now);
 
     firstPlayers = false;
     lastData = d; lastUpdate = Date.now();
@@ -727,6 +754,246 @@
     clearTimeout(basesTimer); basesTimer = null;
     if (!basesComplete) basesTimer = setTimeout(askBases, BASES_SCAN_MS); // sizes still being measured
     listDirty = true; staticDirty = true;
+  }
+
+  // ---------- game events ----------
+  const GAME = {
+    heli: { name: 'Patrol helicopter', icon: '🚁', ring: '#e0634f', moving: true },
+    ch47: { name: 'Chinook', icon: '🚁', ring: '#d9a441', moving: true, note: 'drops a locked crate' },
+    cargo: { name: 'Cargo ship', icon: '🚢', ring: '#4fc3f7', moving: true },
+    bradley: { name: 'Bradley', icon: '', ring: '#e0634f', moving: true },
+    plane: { name: 'Cargo plane', icon: '✈', ring: '#aed581', moving: true, note: 'airdrop on the way' },
+    drop: { name: 'Supply drop', icon: '🪂', ring: '#aed581' },
+    crate: { name: 'Locked crate', icon: '🔒', ring: '#ffb74d' },
+    vendor: { name: 'Travelling vendor', icon: '🛒', ring: '#ba68c8', moving: true },
+    ghostship: { name: 'Ghost ship', icon: '👻', ring: '#90a4ae', moving: true, note: 'Deep Sea' },
+    island: { name: 'Deep Sea island', icon: '🏝', ring: '#4db6ac' },
+    city: { name: 'Floating city', icon: '🏙', ring: '#7986cb', note: 'Deep Sea' }
+  };
+  const ANNOUNCE = { heli: 'arrived', ch47: 'is flying in', cargo: 'arrived', plane: 'is on its way', drop: 'is coming down',
+    vendor: 'arrived', ghostship: 'appeared' };
+  const LEAVES = { heli: 'left', ch47: 'left', cargo: 'left the map', vendor: 'left', ghostship: 'is gone' };
+  function placeName(x, z) {
+    // "at Launch Site (K10)" when a monument is close, otherwise "in K10"
+    let best = null, bestD = 400;
+    for (const m of (mapInfo && mapInfo.monuments) || []) {
+      const dd = Math.hypot(m.x - x, m.z - z);
+      if (dd < bestD) { bestD = dd; best = m.name; }
+    }
+    const grid = gridOf(x, z);
+    return best ? 'at ' + best + (grid ? ' (' + grid + ')' : '') : grid ? 'in ' + grid : 'out at sea';
+  }
+  function updateGameEvents(d, now) {
+    if (!Array.isArray(d.events)) return;
+    const seen = new Set(), gone = [];
+    for (const r of d.events) {
+      // [entityId, kind, x, z, heading, value]
+      const ev = { id: r[0], kind: r[1], x: r[2], z: r[3], heading: r[4], value: r[5] };
+      if (!GAME[ev.kind]) continue;
+      seen.add(ev.id);
+      const old = gameEvents.get(ev.id);
+      if (old) {
+        const cur = currentPos(old, now), jump = Math.hypot(ev.x - cur[0], ev.z - cur[1]) > 400;
+        if (!firstPlayers && ev.kind === 'crate') {
+          if (old.data.value < 0 && ev.value > 0) gameNews('Someone started hacking a locked crate ' + placeName(ev.x, ev.z), ev, d.now);
+          else if (old.data.value > 0 && ev.value === 0) gameNews('A locked crate was opened ' + placeName(ev.x, ev.z), ev, d.now);
+        }
+        Object.assign(old, { data: ev, fromX: jump ? ev.x : cur[0], fromZ: jump ? ev.z : cur[1], toX: ev.x, toZ: ev.z, t0: now, got: now });
+      } else {
+        gameEvents.set(ev.id, { data: ev, fromX: ev.x, fromZ: ev.z, toX: ev.x, toZ: ev.z, t0: now, got: now });
+        if (!firstPlayers && ANNOUNCE[ev.kind]) gameNews(GAME[ev.kind].name + ' ' + ANNOUNCE[ev.kind] + ' ' + placeName(ev.x, ev.z), ev, d.now);
+      }
+    }
+    for (const [id, e] of gameEvents) if (!seen.has(id)) { gameEvents.delete(id); gone.push(e.data); }
+
+    let destroyed = new Set();
+    for (const n of d.news || []) {
+      // [id, time, kind, what, byPlayer, x, z, grid]
+      const [nid, time, kind, what, by, x, z] = n;
+      if (seenNews.has(nid)) continue;
+      seenNews.add(nid);
+      destroyed.add(kind);
+      const name = (GAME[kind] || { name: kind }).name;
+      const text = kind === 'heli'
+        ? name + ' was shot down' + (by ? ' by ' + by : '') + ' ' + placeName(x, z)
+        : name + ' was destroyed' + (by ? ' by ' + by : '') + ' ' + placeName(x, z);
+      gameNews(text, { kind, x, z }, time, !firstPlayers);
+    }
+    if (!firstPlayers) for (const ev of gone) {
+      if (LEAVES[ev.kind] && !destroyed.has(ev.kind)) gameNews(GAME[ev.kind].name + ' ' + LEAVES[ev.kind], ev, d.now);
+    }
+  }
+  function gameNews(text, ev, time, isNew = true) {
+    addEvent('game', text, time, [ev.x, ev.z], isNew, (GAME[ev.kind] || {}).icon || '★');
+  }
+  function crateLeft(e, now) {
+    // seconds left on a crate being hacked, counting down between updates
+    return Math.max(0, Math.ceil(e.data.value - (now - e.got) / 1000));
+  }
+  function gameLabel(e, now) {
+    const ev = e.data, info = GAME[ev.kind];
+    if (ev.kind === 'crate') {
+      if (ev.value === 0) return 'Crate open';
+      if (ev.value > 0) { const s = crateLeft(e, now); return 'Hacking ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+      return '';
+    }
+    if ((ev.kind === 'heli' || ev.kind === 'bradley') && ev.value >= 0) return info.name + ' ' + ev.value + '%';
+    return info.name;
+  }
+  function drawTank(x, y, heading) {
+    g.save(); g.translate(x, y); g.rotate(heading * Math.PI / 180);
+    g.fillStyle = '#d6cfa8'; g.strokeStyle = '#111'; g.lineWidth = 1.2;
+    g.fillRect(-4.5, -6, 9, 12); g.strokeRect(-4.5, -6, 9, 12);
+    g.beginPath(); g.arc(0, 0, 3, 0, Math.PI * 2); g.fill(); g.stroke();
+    g.beginPath(); g.moveTo(0, -2); g.lineTo(0, -10); g.lineWidth = 2; g.stroke();
+    g.restore();
+  }
+  function drawGameEvents(now) {
+    const labels = view.s > 0.3 || gameEvents.size < 15;
+    for (const e of gameEvents.values()) {
+      const ev = e.data, info = GAME[ev.kind], pos = currentPos(e, now), sp = w2s(pos[0], pos[1]);
+      if (!onScreen(sp, 60)) continue;
+      const small = ev.kind === 'crate' && ev.value < 0; // locked crates nobody is hacking: smaller
+      const r = small ? 8 : 11;
+      g.beginPath(); g.arc(sp[0], sp[1], r, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(20,23,26,.85)'; g.fill();
+      g.lineWidth = 2.5; g.strokeStyle = ev.kind === 'crate' && ev.value > 0 ? '#e0634f' : info.ring; g.stroke();
+      if (info.moving && ev.kind !== 'plane') { // direction it is heading
+        const a = ev.heading * Math.PI / 180, sn = Math.sin(a), cs = Math.cos(a);
+        g.beginPath();
+        g.moveTo(sp[0] + (r + 7) * sn, sp[1] - (r + 7) * cs);
+        g.lineTo(sp[0] + (r + 1) * sn + 4 * cs, sp[1] - (r + 1) * cs + 4 * sn);
+        g.lineTo(sp[0] + (r + 1) * sn - 4 * cs, sp[1] - (r + 1) * cs - 4 * sn);
+        g.closePath(); g.fillStyle = info.ring; g.fill();
+      }
+      if (ev.kind === 'bradley') drawTank(sp[0], sp[1], ev.heading);
+      else {
+        const icon = ev.kind === 'crate' ? (ev.value > 0 ? '⏳' : ev.value === 0 ? '🔓' : '🔒') : info.icon;
+        g.save(); g.translate(sp[0], sp[1]);
+        if (ev.kind === 'plane') g.rotate((ev.heading - 90) * Math.PI / 180); // the plane symbol points east
+        g.font = (small ? 10 : 13) + 'px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
+        g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#fff';
+        g.fillText(icon, 0, 1);
+        g.restore();
+      }
+      const label = labels ? gameLabel(e, now) : (ev.kind === 'crate' && ev.value > 0 ? gameLabel(e, now) : '');
+      if (label) {
+        g.font = '600 11px Segoe UI, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'top';
+        outlinedText(label, sp[0], sp[1] + r + 3, ev.kind === 'crate' && ev.value > 0 ? '#ffb4a6' : '#f3ead2');
+      }
+    }
+  }
+  function gameHover(wx, wz, near, now) {
+    const out = [];
+    for (const e of gameEvents.values()) {
+      const pos = currentPos(e, now);
+      if (Math.hypot(wx - pos[0], wz - pos[1]) * near >= 14) continue;
+      const ev = e.data, info = GAME[ev.kind];
+      let t = info.icon + ' ' + info.name;
+      if ((ev.kind === 'heli' || ev.kind === 'bradley') && ev.value >= 0) t += ' · ' + ev.value + '% health';
+      if (ev.kind === 'crate') {
+        const s = crateLeft(e, now);
+        t += ev.value === 0 ? ' · open' : ev.value > 0 ? ' · being hacked, ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + ' left' : ' · locked';
+      }
+      if (info.note) t += ' · ' + info.note;
+      out.push(t);
+    }
+    return out;
+  }
+
+  // ---------- heatmap ----------
+  const HEAT_NAMES = { activity: 'Activity', deaths: 'All deaths', pvp: 'PvP kills' };
+  const PERIOD_NAMES = { hour: 'last hour', day: 'last 24 hours', wipe: 'since the wipe' };
+  const HEAT_STOPS = [[0, [40, 60, 255, 0]], [0.15, [40, 60, 255, 90]], [0.35, [42, 168, 255, 150]], [0.55, [51, 209, 122, 175]],
+    [0.75, [255, 210, 63, 200]], [1, [255, 90, 54, 225]]];
+  const HEAT_LUT = (() => { // 256 colours from "a little" to "a lot"
+    const lut = [];
+    for (let i = 0; i < 256; i++) {
+      const v = i / 255; let k = 1;
+      while (k < HEAT_STOPS.length - 1 && HEAT_STOPS[k][0] < v) k++;
+      const [v0, c0] = HEAT_STOPS[k - 1], [v1, c1] = HEAT_STOPS[k], t = (v - v0) / (v1 - v0 || 1);
+      lut.push(c0.map((c, j) => Math.round(c + (c1[j] - c) * t)));
+    }
+    return lut;
+  })();
+  function loadHeat(d) {
+    // ignore an answer for a choice the user has since changed
+    if (d.layer !== $('heatLayer').value || d.period !== $('heatPeriod').value) return;
+    heat = d; heat.counts = new Map();
+    for (let i = 0; i + 1 < d.data.length; i += 2) heat.counts.set(d.data[i], d.data[i + 1]);
+    heatCanvas = null;
+    const n = d.cells;
+    if (n && d.max > 0) {
+      // soften each square into its neighbours, then colour it; counts use a log scale so quiet areas still show
+      const raw = new Float32Array(n * n), soft = new Float32Array(n * n);
+      for (const [i, c] of heat.counts) raw[i] = Math.log1p(c);
+      let top = 0;
+      for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+        let sum = 0, w = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue;
+          const k = (dx ? 1 : 2) * (dy ? 1 : 2);
+          sum += raw[yy * n + xx] * k; w += k;
+        }
+        const v = Math.max(raw[y * n + x], sum / w);
+        soft[y * n + x] = v; if (v > top) top = v;
+      }
+      heatCanvas = document.createElement('canvas'); heatCanvas.width = heatCanvas.height = n;
+      const hc = heatCanvas.getContext('2d'), img = hc.createImageData(n, n);
+      for (let i = 0; i < n * n; i++) {
+        if (!soft[i]) continue;
+        const c = HEAT_LUT[Math.min(255, Math.round(soft[i] / top * 255))];
+        img.data.set(c, i * 4);
+      }
+      hc.putImageData(img, 0, 0);
+    }
+    updateHeatKey(); viewChanged();
+  }
+  function heatAmount(c) {
+    if (!heat) return '';
+    if (heat.layer === 'activity') {
+      const min = c * heat.interval / 60;
+      return (min < 1 ? 'under a minute' : 'about ' + fmt(Math.round(min)) + ' player-minute' + (Math.round(min) === 1 ? '' : 's')) + ' of ' + (heat.countsIdle ? 'activity' : 'moving around');
+    }
+    return fmt(c) + (heat.layer === 'pvp' ? (c === 1 ? ' player kill' : ' player kills') : (c === 1 ? ' death' : ' deaths'));
+  }
+  function updateHeatKey() {
+    const key = $('heatKey');
+    if (!$('tHeat').checked || !heat) { key.classList.remove('on'); return; }
+    key.classList.add('on'); key.innerHTML = '';
+    const title = document.createElement('div');
+    title.textContent = 'Heatmap: ' + HEAT_NAMES[heat.layer] + ', ' + PERIOD_NAMES[heat.period];
+    key.appendChild(title);
+    const note = document.createElement('div'); note.className = 'ends';
+    if (heat.disabled) note.textContent = 'Switched off in the plugin settings.';
+    else if (!heat.max) note.textContent = 'Nothing recorded in this time yet.';
+    else {
+      const bar = document.createElement('div'); bar.className = 'bar'; key.appendChild(bar);
+      note.innerHTML = '<span>a little</span><span>a lot</span>';
+      key.appendChild(note);
+      const top = document.createElement('div'); top.className = 'ends';
+      top.textContent = 'Busiest square: ' + heatAmount(heat.max);
+      key.appendChild(top);
+      return;
+    }
+    key.appendChild(note);
+  }
+  function drawHeat() {
+    if (!heatCanvas || !heat) return;
+    const half = heat.size / 2, a = w2s(-half, half), b = w2s(half, -half);
+    g.save();
+    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(heatCanvas, a[0], a[1], b[0] - a[0], b[1] - a[1]);
+    g.restore();
+  }
+  function heatHover(wx, wz) {
+    if (!heat || !heat.cells || !$('tHeat').checked) return '';
+    const n = heat.cells, half = heat.size / 2;
+    const cx = Math.floor((wx + half) / heat.size * n), cz = Math.floor((half - wz) / heat.size * n);
+    if (cx < 0 || cz < 0 || cx >= n || cz >= n) return '';
+    const c = heat.counts.get(cz * n + cx) || 0;
+    return c ? 'Heatmap: ' + heatAmount(c) + ' here (' + PERIOD_NAMES[heat.period] + ')' : '';
   }
 
   // ---------- player list ----------
@@ -1043,6 +1310,7 @@
     if (mapImg) {
       g.imageSmoothingQuality = 'high';
       g.drawImage(mapImg, view.ox, view.oy, mapImg.naturalWidth * view.s, mapImg.naturalHeight * view.s);
+      if ($('tHeat').checked) drawHeat();
       if ($('tGrid').checked) drawGrid();
       if ($('tBases').checked) drawBases();
       if ($('tMon').checked) drawMonuments();
@@ -1065,6 +1333,7 @@
     g = ctx;
     const t1 = performance.now();
     if ($('tTrails').checked) drawTrailTails(now);
+    if ($('tGame').checked) drawGameEvents(now);
     drawOnline(now);
     lastPlayersMs = performance.now() - t1;
     lastFrameMs = performance.now() - t0;
@@ -1074,6 +1343,10 @@
     requestAnimationFrame(loop); // first, so one bad frame never stops the map
     let moving = false;
     for (const e of online.values()) if (now - e.t0 < POLL_MS && (e.fromX !== e.toX || e.fromZ !== e.toZ)) { moving = true; break; }
+    if ($('tGame').checked) for (const e of gameEvents.values()) {
+      if (now - e.t0 < POLL_MS && (e.fromX !== e.toX || e.fromZ !== e.toZ)) moving = true;
+      if (e.data.kind === 'crate' && e.data.value > 0 && now - lastDraw > 1000) dirty = true; // hack countdown
+    }
     if (follow && selected && moving && online.has(selected)) centerOn(selected, false);
     if (now - lastStatic > STATIC_REFRESH_MS) staticDirty = true; // fading deaths and trails
     // busy servers: animate movement at about 15 frames a second to spare the computer
@@ -1128,8 +1401,14 @@
   for (const k of TOGGLES) $(k).onchange = () => {
     saveSettings(); viewChanged(); listDirty = true;
     if (k === 'tBases' && $(k).checked) askBases();
+    if (k === 'tHeat') { if ($(k).checked) askHeat(); updateHeatKey(); }
   };
   $('trailLen').onchange = () => { saveSettings(); viewChanged(); };
+  for (const k of ['heatLayer', 'heatPeriod']) $(k).onchange = () => {
+    saveSettings();
+    if (!$('tHeat').checked) { $('tHeat').checked = true; saveSettings(); }
+    heat = null; heatCanvas = null; updateHeatKey(); viewChanged(); askHeat();
+  };
 
   // tooltip: grid square, plus any player, death marker or base under the mouse
   function hoverInfo(e) {
@@ -1147,6 +1426,7 @@
       const d = document.createElement('div'); d.textContent = text; if (cls) d.className = cls; h.appendChild(d); lines.push(d);
     };
     line(gridOf(wx, wz), 'g');
+    const ht = heatHover(wx, wz); if (ht) line(ht);
     const near = metersToPx(1), now = performance.now();
     for (const en of online.values()) {
       const pos = currentPos(en, now);
@@ -1155,6 +1435,7 @@
         line(p.name + ' · ' + (p.status === 'dead' ? 'dead' : Math.round(p.health) + ' hp') + (p.mounted ? ' · in ' + prettyVehicle(p.mounted) : ''));
       }
     }
+    if ($('tGame').checked) for (const t of gameHover(wx, wz, near, now)) line(t);
     if ($('tSleep').checked) {
       for (const p of sleepers.values()) if (Math.hypot(wx - p.x, wz - p.z) * near < 7) line(p.name + ' · sleeping (offline)');
     }
