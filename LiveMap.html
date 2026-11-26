@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust Live Map</title>
+<style>
+  :root {
+    --bg: #14171a; --panel: #1c2024; --panel2: #23282d; --line: #31373d;
+    --text: #e6e3dc; --muted: #8d949b; --accent: #d9a441; --bad: #e0634f; --good: #6cbf6a; --warn: #e3b341;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 "Segoe UI", system-ui, sans-serif; }
+  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  #mapWrap { position: relative; overflow: hidden; cursor: grab; background: #1b3a4b; }
+  #mapWrap.dragging { cursor: grabbing; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #side { background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  header { padding: 12px 16px 10px; border-bottom: 1px solid var(--line); }
+  .titleRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); } .dot.wait { background: var(--accent); }
+  #health { display: none; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 10px; }
+  #health.on { display: grid; }
+  .stat { background: var(--panel2); border-radius: 6px; padding: 5px 6px; text-align: center; }
+  .stat b { display: block; font-size: 14px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 11px; color: var(--muted); }
+  .stat.warn b { color: var(--warn); } .stat.bad b { color: var(--bad); }
+  section { padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 6px 0 3px; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: 7px 9px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  select { padding: 2px 4px; width: auto; font-size: 12px; }
+  .row { display: flex; gap: 8px; } .row > div { flex: 1; } .row > div.port { flex: 0 0 90px; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text); margin: 4px 0 0; cursor: pointer; }
+  button { background: var(--accent); color: #1a1a1a; border: 0; border-radius: 6px; padding: 8px 12px;
+    font: inherit; font-weight: 600; cursor: pointer; }
+  button.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); font-weight: 500; }
+  button.small { padding: 3px 9px; font-size: 12px; }
+  button:hover { filter: brightness(1.1); }
+  #connectBtn { width: 100%; margin-top: 10px; }
+  #discBtn { display: none; }
+  .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tab { flex: 1; text-align: center; padding: 8px 4px; cursor: pointer; color: var(--muted); font-weight: 600; font-size: 13px;
+    border-bottom: 2px solid transparent; user-select: none; }
+  .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: var(--bad);
+    color: #fff; font-size: 11px; line-height: 18px; }
+  .badge:empty { display: none; }
+  .pane { flex: 1; overflow-y: auto; padding: 6px 8px; display: none; min-height: 0; }
+  .pane.on { display: block; }
+  .p { display: grid; grid-template-columns: 14px 1fr auto; gap: 2px 8px; align-items: center;
+    padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+  .p:hover { background: var(--panel2); }
+  .p.sel { background: #2c3238; outline: 1px solid var(--accent); }
+  .p .sw { width: 12px; height: 12px; border-radius: 50%; }
+  .p .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .p .gr { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+  .p .sub { grid-column: 2 / 4; color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); padding: 10px 8px; }
+  .chatLine, .ev { padding: 4px 6px; border-radius: 5px; font-size: 13px; word-wrap: break-word; }
+  .chatLine .t, .ev .t { color: var(--muted); font-size: 11px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .chatLine .who { font-weight: 600; margin-right: 4px; }
+  .chatLine .ch { color: var(--good); font-size: 11px; margin-right: 4px; }
+  .chatLine.server .who { color: var(--accent); }
+  .ev { cursor: default; }
+  .ev.click { cursor: pointer; } .ev.click:hover { background: var(--panel2); }
+  .ev .ic { display: inline-block; width: 16px; text-align: center; margin-right: 4px; }
+  .ev.join .ic { color: var(--good); } .ev.leave .ic { color: var(--muted); } .ev.death .ic { color: var(--bad); }
+  #chatForm { display: none; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
+  #chatForm.on { display: flex; }
+  #chatForm input { flex: 1; }
+  footer { padding: 7px 16px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+  #zoomBtns { position: absolute; right: 12px; top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  #zoomBtns button { width: 34px; height: 34px; padding: 0; font-size: 18px; }
+  #msg { position: absolute; left: 50%; top: 45%; transform: translate(-50%,-50%); background: rgba(20,23,26,.88);
+    padding: 16px 22px; border-radius: 10px; color: var(--text); max-width: 420px; text-align: center; }
+  #msg:empty { display: none; }
+  #hover { position: absolute; pointer-events: none; background: rgba(20,23,26,.93); padding: 5px 8px;
+    border-radius: 5px; font-size: 12px; color: var(--text); display: none; max-width: 320px; }
+  #hover .g { color: var(--accent); font-weight: 600; }
+  #hover div + div { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--line); }
+  #toasts { position: absolute; left: 12px; top: 12px; display: flex; flex-direction: column; gap: 6px; pointer-events: none; max-width: 360px; }
+  .toast { background: rgba(20,23,26,.92); border-left: 3px solid var(--accent); padding: 7px 11px; border-radius: 5px;
+    font-size: 13px; transition: opacity .5s; }
+  .toast.join { border-color: var(--good); } .toast.leave { border-color: var(--muted); }
+  .toast.death { border-color: var(--bad); } .toast.chat { border-color: #4fc3f7; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="mapWrap">
+    <canvas id="cv"></canvas>
+    <div id="toasts"></div>
+    <div id="zoomBtns">
+      <button class="ghost" id="zin" title="Zoom in">+</button>
+      <button class="ghost" id="zout" title="Zoom out">&minus;</button>
+      <button class="ghost" id="zfit" title="Show whole map">&#9635;</button>
+    </div>
+    <div id="msg">Fill in the server details on the right and press Connect.</div>
+    <div id="hover"></div>
+  </div>
+
+  <aside id="side">
+    <header>
+      <div class="titleRow">
+        <h1>Rust Live Map</h1>
+        <button class="ghost small" id="discBtn">Disconnect</button>
+      </div>
+      <div class="status"><span class="dot" id="stDot"></span><span id="stText">Not connected</span></div>
+      <div id="health">
+        <div class="stat" id="hFps"><b>-</b><span>FPS</span></div>
+        <div class="stat" id="hEnt"><b>-</b><span>entities</span></div>
+        <div class="stat" id="hMem"><b>-</b><span>memory</span></div>
+        <div class="stat" id="hUp"><b>-</b><span>uptime</span></div>
+      </div>
+    </header>
+
+    <section id="connBox">
+      <div class="row">
+        <div><label for="host">Server address</label><input type="text" id="host" value="127.0.0.1"></div>
+        <div class="port"><label for="port">RCON port</label><input type="number" id="port" value="28016"></div>
+      </div>
+      <label for="pw">RCON password</label>
+      <input type="password" id="pw" autocomplete="off">
+      <label class="check"><input type="checkbox" id="remember"> Remember on this computer</label>
+      <button id="connectBtn">Connect</button>
+    </section>
+
+    <section>
+      <div class="toggles">
+        <label class="check"><input type="checkbox" id="tGrid" checked> Grid</label>
+        <label class="check"><input type="checkbox" id="tMon" checked> Monuments</label>
+        <label class="check"><input type="checkbox" id="tSleep" checked> Sleepers</label>
+        <label class="check"><input type="checkbox" id="tNames" checked> Names</label>
+        <label class="check"><input type="checkbox" id="tTrails" checked> Trails
+          <select id="trailLen" title="How far back trails go">
+            <option value="10">10 min</option><option value="30" selected>30 min</option><option value="60">60 min</option>
+          </select></label>
+        <label class="check"><input type="checkbox" id="tDeaths" checked> Deaths</label>
+        <label class="check"><input type="checkbox" id="tBases" checked> Bases</label>
+        <label class="check"><input type="checkbox" id="tSound" checked> Sounds</label>
+      </div>
+    </section>
+
+    <div class="tabs">
+      <div class="tab on" data-pane="players">Players</div>
+      <div class="tab" data-pane="chat">Chat<span class="badge" id="chatBadge"></span></div>
+      <div class="tab" data-pane="events">Events<span class="badge" id="evBadge"></span></div>
+    </div>
+    <div class="pane on" id="pane-players"><div class="empty">No data yet.</div></div>
+    <div class="pane" id="pane-chat"><div class="empty">No chat yet.</div></div>
+    <div class="pane" id="pane-events"><div class="empty">Joins, leaves and deaths show up here.</div></div>
+    <form id="chatForm" autocomplete="off">
+      <input type="text" id="chatInput" maxlength="250" placeholder="Message to everyone (as SERVER)">
+      <button type="submit">Send</button>
+    </form>
+    <footer id="foot">&nbsp;</footer>
+  </aside>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const POLL_MS = 2000, INFO_MS = 5000, BASES_MS = 60000;
+  const ID = { map: 7001, players: 7002, trails: 7003, bases: 7004, info: 7005, chatTail: 7006, say: 7007 };
+  const TEAM_COLORS = ['#4fc3f7', '#f06292', '#aed581', '#ffb74d', '#ba68c8', '#4db6ac', '#fff176', '#90a4ae', '#ff8a65', '#7986cb'];
+  const DEATH_SHOW_SECONDS = 60 * 60;
+  const TOGGLES = ['tGrid', 'tMon', 'tSleep', 'tNames', 'tTrails', 'tDeaths', 'tBases', 'tSound'];
+
+  const $ = id => document.getElementById(id);
+  const cv = $('cv'), ctx = cv.getContext('2d'), wrap = $('mapWrap');
+
+  // ---------- state ----------
+  let ws = null, wantConnected = false, timers = [], retryTimer = null;
+  let mapInfo = null, mapImg = null;
+  let players = new Map();          // id -> {data, fromX, fromZ, toX, toZ, t0}
+  let lastData = null, lastUpdate = 0, firstPlayers = true;
+  let serverOffset = 0;             // server unix seconds - local unix seconds
+  let trails = new Map();           // id -> [[t,x,z], ...]
+  let deaths = [], seenDeaths = new Set();
+  let bases = [];
+  let chat = [], events = [];
+  let activePane = 'players', unread = { chat: 0, events: 0 };
+  let selected = null, follow = false;
+  let view = { s: 0.3, ox: 0, oy: 0 }; // screen = img * s + o
+  let dirty = true;
+
+  // ---------- saved settings (stay in this browser only) ----------
+  try {
+    const saved = JSON.parse(localStorage.getItem('rustLiveMap') || '{}');
+    if (saved.host) $('host').value = saved.host;
+    if (saved.port) $('port').value = saved.port;
+    if (saved.pw) { $('pw').value = saved.pw; $('remember').checked = true; }
+    if (saved.trailLen) $('trailLen').value = saved.trailLen;
+    for (const k of TOGGLES) if (k in saved) $(k).checked = saved[k];
+  } catch (e) {}
+  function saveSettings() {
+    const s = { host: $('host').value.trim(), port: $('port').value, trailLen: $('trailLen').value };
+    if ($('remember').checked) s.pw = $('pw').value;
+    for (const k of TOGGLES) s[k] = $(k).checked;
+    localStorage.setItem('rustLiveMap', JSON.stringify(s));
+  }
+
+  // ---------- connection ----------
+  function setStatus(kind, text) { $('stDot').className = 'dot ' + kind; $('stText').textContent = text; }
+  function showMsg(t) { $('msg').textContent = t || ''; }
+  function stopTimers() { timers.forEach(clearInterval); timers = []; }
+
+  function connect() {
+    const host = $('host').value.trim(), port = $('port').value.trim(), pw = $('pw').value;
+    if (!host || !port || !pw) { showMsg('Please fill in address, port and password.'); return; }
+    saveSettings();
+    wantConnected = true;
+    clearTimeout(retryTimer);
+    if (ws) { ws.onclose = null; ws.close(); }
+    setStatus('wait', 'Connecting...');
+    let opened = false;
+    try { ws = new WebSocket('ws://' + host + ':' + port + '/' + encodeURIComponent(pw)); }
+    catch (e) { setStatus('bad', 'Bad address'); return; }
+
+    ws.onopen = () => {
+      opened = true;
+      setStatus('ok', 'Connected to ' + host);
+      $('connBox').style.display = 'none';
+      $('discBtn').style.display = 'block';
+      showMsg(mapImg ? '' : 'Loading map image...');
+      if (!mapImg) send('livemap.map', ID.map);
+      send('livemap.trails', ID.trails);
+      send('chat.tail 50', ID.chatTail);
+      const poll = () => send('livemap.players', ID.players);
+      const info = () => send('serverinfo', ID.info);
+      const bas = () => send('livemap.bases', ID.bases);
+      poll(); info(); bas();
+      stopTimers();
+      timers.push(setInterval(poll, POLL_MS), setInterval(info, INFO_MS), setInterval(bas, BASES_MS));
+    };
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.Type === 'Chat') { try { addChat(JSON.parse(m.Message), true); } catch (e) {} return; }
+      const txt = (m.Message || '').trim();
+      if (m.Identifier === ID.players && /not found|unknown command/i.test(txt)) {
+        showMsg('Connected, but the Admin Live Map plugin (AdminLiveMap.cs) is not answering. Is it installed and loaded on the server?');
+        return;
+      }
+      if (!txt.startsWith('{') && !txt.startsWith('[')) return; // other text, e.g. "Rendering map image..."
+      let d; try { d = JSON.parse(txt); } catch (e) { return; }
+      switch (m.Identifier) {
+        case ID.map: if (d.type === 'map') loadMap(d); else if (d.type === 'error') showMsg(d.message); break;
+        case ID.players: if (d.type === 'players') updatePlayers(d); break;
+        case ID.trails: if (d.type === 'trails') loadTrails(d); break;
+        case ID.bases: if (d.type === 'bases') { bases = d.bases; dirty = true; } break;
+        case ID.info: updateHealth(d); break;
+        case ID.chatTail: if (Array.isArray(d)) { chat = []; d.forEach(c => addChat(c, false)); renderChat(); } break;
+      }
+    };
+    ws.onclose = () => {
+      stopTimers();
+      if (!wantConnected) { setStatus('', 'Not connected'); return; }
+      if (!opened) {
+        wantConnected = false;
+        showConnBox();
+        setStatus('bad', 'Could not connect');
+        showMsg('Could not connect. Check that the server is running and that the address, port and RCON password are right.');
+        return;
+      }
+      setStatus('wait', 'Connection lost, retrying...');
+      retryTimer = setTimeout(connect, 5000);
+    };
+  }
+  function showConnBox() { $('connBox').style.display = ''; $('discBtn').style.display = 'none'; }
+  function disconnect() {
+    wantConnected = false;
+    stopTimers(); clearTimeout(retryTimer);
+    if (ws) ws.close();
+    showConnBox();
+    $('health').classList.remove('on');
+  }
+  function send(cmd, id) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ Identifier: id, Message: cmd, Name: 'LiveMap' }));
+  }
+  $('connectBtn').onclick = connect;
+  $('discBtn').onclick = disconnect;
+  $('pw').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+  $('remember').onchange = saveSettings;
+
+  // ---------- server health ----------
+  function setStat(id, value, level) {
+    const el = $(id); el.querySelector('b').textContent = value;
+    el.className = 'stat' + (level ? ' ' + level : '');
+  }
+  function updateHealth(d) {
+    if (typeof d.Framerate !== 'number') return;
+    $('health').classList.add('on');
+    const fps = Math.round(d.Framerate);
+    setStat('hFps', fps, fps < 15 ? 'bad' : fps < 30 ? 'warn' : '');
+    setStat('hEnt', d.EntityCount >= 1000 ? Math.round(d.EntityCount / 1000) + 'k' : d.EntityCount);
+    setStat('hMem', d.Memory >= 1000 ? (d.Memory / 1024).toFixed(1) + ' GB' : d.Memory + ' MB');
+    const up = d.Uptime, hrs = Math.floor(up / 3600), mins = Math.floor(up % 3600 / 60);
+    setStat('hUp', hrs >= 24 ? Math.floor(hrs / 24) + 'd ' + (hrs % 24) + 'h' : hrs + 'h ' + mins + 'm');
+    $('hFps').title = 'Server frames per second. Below 30 players may feel lag.';
+    $('hMem').title = 'Memory used by the game server' + (d.MemoryUsageSystem ? ' (whole process: ' + (d.MemoryUsageSystem / 1024).toFixed(1) + ' GB)' : '');
+    $('hUp').title = 'Time since the server was started';
+    $('hEnt').title = d.EntityCount + ' entities (buildings, items, animals...)';
+  }
+
+  // ---------- map ----------
+  function loadMap(d) {
+    const img = new Image();
+    img.onload = () => { mapInfo = d; mapImg = img; showMsg(''); fit(); };
+    img.src = d.image;
+  }
+  function w2i(x, z) {
+    const inner = mapImg.naturalWidth - 2 * mapInfo.margin;
+    const k = inner / mapInfo.size, half = mapInfo.size / 2;
+    return [mapInfo.margin + (x + half) * k, mapInfo.margin + (half - z) * k];
+  }
+  function i2s(px, py) { return [px * view.s + view.ox, py * view.s + view.oy]; }
+  function w2s(x, z) { const p = w2i(x, z); return i2s(p[0], p[1]); }
+  function metersToPx(m) { return m * (mapImg.naturalWidth - 2 * mapInfo.margin) / mapInfo.size * view.s; }
+
+  function resize() {
+    const r = wrap.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    dirty = true;
+  }
+  function fit() {
+    if (!mapImg) return;
+    const r = wrap.getBoundingClientRect();
+    const s = Math.min(r.width, r.height) / mapImg.naturalWidth * 0.98;
+    view.s = s;
+    view.ox = (r.width - mapImg.naturalWidth * s) / 2;
+    view.oy = (r.height - mapImg.naturalHeight * s) / 2;
+    dirty = true;
+  }
+  function zoomAt(f, sx, sy) {
+    const ns = Math.max(0.05, Math.min(6, view.s * f));
+    f = ns / view.s;
+    view.ox = sx - (sx - view.ox) * f;
+    view.oy = sy - (sy - view.oy) * f;
+    view.s = ns;
+    dirty = true;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- helpers ----------
+  function colorFor(team, id) {
+    const key = team || id || '';
+    let h = 0; for (const c of key) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    return TEAM_COLORS[h % TEAM_COLORS.length];
+  }
+  function serverNow() { return Date.now() / 1000 + serverOffset; }
+  function clock(unix) {
+    const d = new Date((unix - serverOffset) * 1000);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  function ago(sec) {
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return 'just now';
+    if (sec < 3600) return Math.round(sec / 60) + ' min ago';
+    return Math.floor(sec / 3600) + 'h ' + Math.round(sec % 3600 / 60) + 'm ago';
+  }
+  function isSteamId(id) { return /^7656\d{13}$/.test(id); }
+
+  // ---------- sounds ----------
+  let audio = null;
+  function beep(kind) {
+    if (!$('tSound').checked) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      const notes = { join: [523, 784], leave: [523, 392], death: [196, 147], chat: [880] }[kind] || [660];
+      let t = audio.currentTime;
+      for (const f of notes) {
+        const o = audio.createOscillator(), g = audio.createGain();
+        o.frequency.value = f; o.type = kind === 'death' ? 'triangle' : 'sine';
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+        o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.2);
+        t += 0.13;
+      }
+    } catch (e) {}
+  }
+
+  // ---------- toasts & events ----------
+  function toast(kind, text) {
+    const el = document.createElement('div');
+    el.className = 'toast ' + kind; el.textContent = text;
+    $('toasts').prepend(el);
+    while ($('toasts').children.length > 5) $('toasts').lastChild.remove();
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 600); }, 6000);
+  }
+  function addEvent(kind, text, time, pos, live) {
+    events.push({ kind, text, time, pos });
+    events.sort((a, b) => a.time - b.time);
+    if (events.length > 300) events.shift();
+    if (live) {
+      toast(kind, text); beep(kind);
+      if (activePane !== 'events') unread.events++;
+    }
+    renderEvents();
+  }
+  function renderEvents() {
+    const box = $('pane-events');
+    $('evBadge').textContent = unread.events || '';
+    if (!events.length) { box.innerHTML = '<div class="empty">Joins, leaves and deaths show up here.</div>'; return; }
+    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    box.innerHTML = '';
+    const icons = { join: '▶', leave: '◀', death: '☠' };
+    for (const e of events) {
+      const el = document.createElement('div');
+      el.className = 'ev ' + e.kind + (e.pos ? ' click' : '');
+      el.innerHTML = '<span class="t"></span><span class="ic"></span><span class="tx"></span>';
+      el.querySelector('.t').textContent = clock(e.time);
+      el.querySelector('.ic').textContent = icons[e.kind] || '•';
+      el.querySelector('.tx').textContent = e.text;
+      if (e.pos) { el.title = 'Show on map'; el.onclick = () => { follow = false; centerOnWorld(e.pos[0], e.pos[1], true); }; }
+      box.appendChild(el);
+    }
+    if (stick) box.scrollTop = box.scrollHeight;
+  }
+
+  // ---------- chat ----------
+  const CHANNELS = { 1: 'Team', 3: 'Cards', 4: 'Local', 5: 'Clan' };
+  function addChat(c, live) {
+    if (!c || typeof c.Message !== 'string') return;
+    chat.push({ time: c.Time, name: c.Username, msg: c.Message, channel: c.Channel, color: c.Color, server: c.Channel === 2 || c.UserId === '0' });
+    if (chat.length > 300) chat.shift();
+    if (live) {
+      if (activePane !== 'chat') { unread.chat++; toast('chat', c.Username + ': ' + c.Message); beep('chat'); }
+      renderChat();
+    }
+  }
+  function renderChat() {
+    const box = $('pane-chat');
+    $('chatBadge').textContent = unread.chat || '';
+    if (!chat.length) { box.innerHTML = '<div class="empty">No chat yet.</div>'; return; }
+    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    box.innerHTML = '';
+    for (const c of chat) {
+      const el = document.createElement('div');
+      el.className = 'chatLine' + (c.server ? ' server' : '');
+      el.innerHTML = '<span class="t"></span><span class="ch"></span><span class="who"></span><span class="m"></span>';
+      el.querySelector('.t').textContent = clock(c.time);
+      el.querySelector('.ch').textContent = CHANNELS[c.channel] ? '[' + CHANNELS[c.channel] + ']' : '';
+      const who = el.querySelector('.who');
+      who.textContent = c.name + ':';
+      if (!c.server && /^#[0-9a-f]{3,8}$/i.test(c.color || '')) who.style.color = c.color;
+      el.querySelector('.m').textContent = c.msg;
+      box.appendChild(el);
+    }
+    if (stick || activePane !== 'chat') box.scrollTop = box.scrollHeight;
+  }
+  $('chatForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const text = $('chatInput').value.replace(/[\r\n]+/g, ' ').trim();
+    if (!text || !ws || ws.readyState !== 1) return;
+    send('say ' + text, ID.say);
+    $('chatInput').value = '';
+  });
+
+  // ---------- tabs ----------
+  for (const t of document.querySelectorAll('.tab')) {
+    t.onclick = () => {
+      activePane = t.dataset.pane;
+      document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+      document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'pane-' + activePane));
+      $('chatForm').classList.toggle('on', activePane === 'chat');
+      if (activePane === 'chat') { unread.chat = 0; renderChat(); $('pane-chat').scrollTop = 1e9; }
+      if (activePane === 'events') { unread.events = 0; renderEvents(); $('pane-events').scrollTop = 1e9; }
+    };
+  }
+
+  // ---------- players ----------
+  function updatePlayers(d) {
+    if (typeof d.now === 'number') serverOffset = d.now - Date.now() / 1000;
+    const now = performance.now(), seen = new Set();
+    for (const p of d.players) {
+      if (seen.has(p.id)) continue; // never handle the same player twice in one update
+      seen.add(p.id);
+      const old = players.get(p.id);
+      if (!firstPlayers) {
+        const was = old ? old.data.status : null;
+        if (p.status === 'online' && was !== 'online' && was !== 'dead')
+          addEvent('join', p.name + (old ? ' joined' : ' joined for the first time'), d.now, [p.x, p.z], true);
+        if (old && (was === 'online' || was === 'dead') && p.status === 'sleeping')
+          addEvent('leave', p.name + ' left', d.now, [p.x, p.z], true);
+      }
+      if (old) {
+        const cur = currentPos(old, now);
+        const jump = Math.hypot(p.x - cur[0], p.z - cur[1]) > 300; // teleport / respawn: don't slide
+        Object.assign(old, { data: p, fromX: jump ? p.x : cur[0], fromZ: jump ? p.z : cur[1], toX: p.x, toZ: p.z, t0: now });
+      } else {
+        players.set(p.id, { data: p, fromX: p.x, fromZ: p.z, toX: p.x, toZ: p.z, t0: now });
+      }
+      if (p.status === 'online') addTrailPoint(p.id, d.now, p.x, p.z);
+    }
+    for (const id of [...players.keys()]) if (!seen.has(id)) players.delete(id);
+
+    deaths = d.deaths || [];
+    for (const x of deaths) {
+      if (seenDeaths.has(x.id)) continue;
+      seenDeaths.add(x.id);
+      addEvent('death', deathText(x), x.time, [x.x, x.z], !firstPlayers);
+    }
+
+    firstPlayers = false;
+    lastData = d; lastUpdate = Date.now();
+    renderList();
+    dirty = true;
+  }
+  const DAMAGE_WORDS = { fall: 'fell to their death', bleeding: 'bled out', hunger: 'starved', thirst: 'died of thirst',
+    cold: 'froze to death', heat: 'burned to death', drowned: 'drowned', radiationexposure: 'died of radiation',
+    radiation: 'died of radiation', poison: 'was poisoned', suicide: 'killed themselves', generic: 'died', collision: 'was run over' };
+  function deathText(x) {
+    let s;
+    if (x.killer === 'themselves') s = x.victim + ' killed themselves';
+    else if (!x.killerId && DAMAGE_WORDS[x.killer]) s = x.victim + ' ' + DAMAGE_WORDS[x.killer];
+    else s = x.victim + ' was killed by ' + (x.killerId ? x.killer : friendlyKiller(x.killer));
+    const extra = [];
+    if (x.weapon) extra.push(x.weapon);
+    if (x.distance > 1) extra.push(x.distance + ' m');
+    if (extra.length) s += ' (' + extra.join(', ') + ')';
+    return s + ' in ' + x.grid;
+  }
+  // turn game object names into words, e.g. "scientistnpc roam" -> "a scientist"
+  const KILLERS = [
+    [/scarecrow|zombie/, 'a scarecrow'], [/scientist|npc|tunneldweller|underwaterdweller|bandit|guard/, 'a scientist'], [/patrolhelicopter|heli/, 'the patrol helicopter'],
+    [/bradley/, 'the Bradley tank'], [/autoturret/, 'an auto turret'], [/flameturret/, 'a flame turret'],
+    [/guntrap/, 'a shotgun trap'], [/samsite/, 'a SAM site'], [/landmine/, 'a landmine'], [/beartrap/, 'a bear trap'],
+    [/wolf/, 'a wolf'], [/bear/, 'a bear'], [/boar/, 'a boar'], [/stag/, 'a stag'], [/chicken/, 'a chicken'],
+    [/shark/, 'a shark'], [/crocodile/, 'a crocodile'], [/tiger/, 'a tiger'], [/panther/, 'a panther'], [/snake/, 'a snake'],
+    [/barricade|spikes/, 'a barricade'], [/campfire|fireplace|furnace/, 'a fire'], [/cargoship/, 'the cargo ship'],
+    [/train|workcart/, 'a train'], [/minicopter|scraptransport|attackhelicopter|car|horse|boat|rhib|sub/, 'a vehicle']
+  ];
+  function friendlyKiller(k) {
+    for (const [re, word] of KILLERS) if (re.test(k)) return word;
+    return 'a ' + k;
+  }
+  function currentPos(e, now) {
+    const t = Math.min(1, (now - e.t0) / POLL_MS);
+    return [e.fromX + (e.toX - e.fromX) * t, e.fromZ + (e.toZ - e.fromZ) * t];
+  }
+  function visible(p) { return p.status !== 'sleeping' || $('tSleep').checked; }
+
+  // ---------- trails ----------
+  function loadTrails(d) {
+    if (typeof d.now === 'number') serverOffset = d.now - Date.now() / 1000;
+    for (const id in d.trails) {
+      const server = d.trails[id], mine = trails.get(id) || [];
+      const lastT = server.length ? server[server.length - 1][0] : 0;
+      trails.set(id, server.concat(mine.filter(p => p[0] > lastT)));
+    }
+    dirty = true;
+  }
+  function addTrailPoint(id, t, x, z) {
+    let tr = trails.get(id);
+    if (!tr) trails.set(id, tr = []);
+    const last = tr[tr.length - 1];
+    if (last && Math.hypot(x - last[1], z - last[2]) < 3) return;
+    tr.push([t, x, z]);
+    const cutoff = t - 3600;
+    while (tr.length && tr[0][0] < cutoff) tr.shift();
+  }
+
+  const STATUS_ORDER = { online: 0, dead: 1, sleeping: 2 };
+  function renderList() {
+    const box = $('pane-players');
+    const list = [...players.values()].map(e => e.data)
+      .sort((a, b) => (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || a.name.localeCompare(b.name));
+    if (!list.length) { box.innerHTML = '<div class="empty">No players on this server.</div>'; return; }
+    const names = {}; for (const p of list) names[p.id] = p.name;
+    box.innerHTML = '';
+    for (const p of list) {
+      const el = document.createElement('div');
+      el.className = 'p' + (p.id === selected ? ' sel' : '');
+      const status = p.status === 'online' ? (p.asleep ? 'Online (still asleep)' : 'Online') : p.status === 'dead' ? 'Dead' : 'Sleeping (offline)';
+      const parts = [status];
+      if (p.status !== 'dead') parts.push(Math.round(p.health) + ' hp');
+      if (p.mounted) parts.push('in ' + prettyVehicle(p.mounted));
+      if (p.team) parts.push('team' + (p.leader && names[p.leader] ? ' of ' + names[p.leader] : ''));
+      const nBases = bases.filter(b => b.ownerId === p.id && !b.extraTc).length;
+      if (nBases) parts.push(nBases + (nBases === 1 ? ' base' : ' bases'));
+      el.innerHTML = '<span class="sw"></span><span class="nm"></span><span class="gr"></span><span class="sub"></span>';
+      const sw = el.querySelector('.sw'), col = colorFor(p.team, p.id);
+      sw.style.background = p.status === 'online' ? col : 'transparent';
+      sw.style.border = '2px solid ' + (p.status === 'dead' ? 'var(--bad)' : col);
+      el.querySelector('.nm').textContent = p.name;
+      el.querySelector('.gr').textContent = p.grid;
+      el.querySelector('.sub').textContent = parts.join(' · ');
+      el.onclick = () => {
+        if (selected === p.id && follow) { follow = false; selected = null; }
+        else { selected = p.id; follow = true; centerOn(p.id, true); }
+        renderList(); dirty = true;
+      };
+      box.appendChild(el);
+    }
+  }
+  function prettyVehicle(s) {
+    return s.replace(/\.entity$/, '').replace(/[._]/g, ' ').replace(/\b(seat|driver|passenger)\b/g, '').trim();
+  }
+  function centerOnWorld(x, z, zoomIn) {
+    if (!mapImg) return;
+    const r = wrap.getBoundingClientRect();
+    if (zoomIn && view.s < 0.8) view.s = 0.8;
+    const ip = w2i(x, z);
+    view.ox = r.width / 2 - ip[0] * view.s;
+    view.oy = r.height / 2 - ip[1] * view.s;
+    dirty = true;
+  }
+  function centerOn(id, zoomIn) {
+    const e = players.get(id); if (!e) return;
+    const pos = currentPos(e, performance.now());
+    centerOnWorld(pos[0], pos[1], zoomIn);
+  }
+
+  // ---------- drawing ----------
+  function gridName(col) {
+    let s = ''; col += 1;
+    while (col > 0) { const m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = Math.floor((col - 1) / 26); }
+    return s;
+  }
+  function outlinedText(text, x, y, fill) {
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(text, x, y);
+    ctx.fillStyle = fill; ctx.fillText(text, x, y);
+  }
+  function drawGrid(r) {
+    const half = mapInfo.size / 2, cell = mapInfo.cell, n = Math.ceil(mapInfo.size / cell);
+    const a = w2s(-half, half), b = w2s(half, -half);
+    const cellPx = (b[0] - a[0]) / (mapInfo.size / cell);
+    ctx.strokeStyle = 'rgba(0,0,0,.28)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i <= n; i++) {
+      const x = Math.round(Math.min(b[0], a[0] + i * cellPx)) + .5, y = Math.round(Math.min(b[1], a[1] + i * cellPx)) + .5;
+      ctx.moveTo(x, a[1]); ctx.lineTo(x, b[1]);
+      ctx.moveTo(a[0], y); ctx.lineTo(b[0], y);
+    }
+    ctx.stroke();
+    if (cellPx > 26) {
+      ctx.font = '600 ' + Math.min(13, Math.max(9, cellPx / 6)) + 'px Segoe UI, sans-serif';
+      ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+      for (let c = 0; c < n; c++) for (let rw = 0; rw < n; rw++) {
+        const x = a[0] + c * cellPx, y = a[1] + rw * cellPx;
+        if (x > r.width || y > r.height || x + cellPx < 0 || y + cellPx < 0) continue;
+        ctx.fillText(gridName(c) + rw, x + 3, y + 2);
+      }
+    }
+  }
+  function drawMonuments() {
+    ctx.font = '600 ' + (view.s > 0.45 ? 12 : 10) + 'px Segoe UI, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const m of mapInfo.monuments || []) {
+      if (view.s < 0.25 && /cave|tunnel|entrance|well|lake|oasis|swamp|power line/i.test(m.name)) continue;
+      const p = w2s(m.x, m.z);
+      outlinedText(m.name, p[0], p[1], '#f3ead2');
+    }
+  }
+  function drawBases() {
+    for (const b of bases) {
+      const owned = b.playerOwned, col = owned ? colorFor(b.team, b.ownerId) : '#9aa0a6';
+      const p1 = w2s(b.minX, b.maxZ), p2 = w2s(b.maxX, b.minZ);
+      let w = p2[0] - p1[0], h = p2[1] - p1[1];
+      const cx = (p1[0] + p2[0]) / 2, cy = (p1[1] + p2[1]) / 2;
+      if (w < 8) { w = 8; } if (h < 8) { h = 8; }
+      ctx.save();
+      ctx.globalAlpha = 0.22; ctx.fillStyle = col; ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
+      ctx.globalAlpha = 0.95; ctx.strokeStyle = col; ctx.lineWidth = 2;
+      if (!owned) ctx.setLineDash([4, 3]);
+      ctx.strokeRect(cx - w / 2, cy - h / 2, w, h);
+      ctx.setLineDash([]);
+      // cupboard icon
+      const t = w2s(b.x, b.z);
+      ctx.fillStyle = '#111'; ctx.fillRect(t[0] - 3.5, t[1] - 3.5, 7, 7);
+      ctx.fillStyle = col; ctx.fillRect(t[0] - 2.5, t[1] - 2.5, 5, 5);
+      if (view.s > 0.35 && !b.extraTc) {
+        ctx.font = '600 11px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        outlinedText(owned ? (b.owner || 'base') : 'event / unowned', cx, cy + h / 2 + 2, owned ? col : '#c9c9c9');
+      }
+      ctx.restore();
+    }
+  }
+  function drawTrails() {
+    const len = Number($('trailLen').value) * 60, now = serverNow();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const [id, tr] of trails) {
+      const e = players.get(id);
+      if (e && !visible(e.data)) continue;
+      const col = e ? colorFor(e.data.team, id) : colorFor(null, id);
+      // collect visible segments: [x1, y1, x2, y2, alpha]
+      const segs = [];
+      let prev = null;
+      for (const pt of tr) {
+        const age = now - pt[0];
+        if (age > len) { prev = null; continue; }
+        if (prev && Math.hypot(pt[1] - prev[1], pt[2] - prev[2]) < 300 && pt[0] - prev[0] < 180) {
+          const a = w2s(prev[1], prev[2]), b = w2s(pt[1], pt[2]);
+          segs.push([a[0], a[1], b[0], b[1], 0.3 + 0.7 * (1 - age / len)]);
+        }
+        prev = pt;
+      }
+      // join the last point to where the player is drawn right now
+      if (prev && e && e.data.status === 'online') {
+        const cur = currentPos(e, performance.now());
+        if (Math.hypot(cur[0] - prev[1], cur[1] - prev[2]) < 300) {
+          const a = w2s(prev[1], prev[2]), b = w2s(cur[0], cur[1]);
+          segs.push([a[0], a[1], b[0], b[1], 1]);
+        }
+      }
+      // dark outline first, then the coloured line on top
+      for (const [width, style, k] of [[6, 'rgba(0,0,0,1)', 0.55], [3, col, 1]]) {
+        ctx.lineWidth = width; ctx.strokeStyle = style;
+        for (const s of segs) {
+          ctx.globalAlpha = s[4] * k;
+          ctx.beginPath(); ctx.moveTo(s[0], s[1]); ctx.lineTo(s[2], s[3]); ctx.stroke();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawDeaths() {
+    const now = serverNow();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const x of deaths) {
+      const age = now - x.time;
+      if (age > DEATH_SHOW_SECONDS) continue;
+      const p = w2s(x.x, x.z);
+      ctx.globalAlpha = 0.45 + 0.55 * (1 - age / DEATH_SHOW_SECONDS);
+      ctx.beginPath(); ctx.arc(p[0], p[1], 8, 0, Math.PI * 2);
+      ctx.fillStyle = '#2a1512'; ctx.fill(); ctx.strokeStyle = '#e0634f'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.font = '12px Segoe UI Symbol, Segoe UI, sans-serif'; ctx.fillStyle = '#f2d0c8';
+      ctx.fillText('☠', p[0], p[1] + 0.5);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawPlayers(now) {
+    const order = [...players.values()].sort((a, b) => STATUS_ORDER[b.data.status] - STATUS_ORDER[a.data.status]);
+    for (const e of order) {
+      const p = e.data; if (!visible(p)) continue;
+      const pos = currentPos(e, now), sp = w2s(pos[0], pos[1]);
+      const col = colorFor(p.team, p.id), isSel = p.id === selected;
+      ctx.save(); ctx.translate(sp[0], sp[1]);
+      if (isSel) { ctx.beginPath(); ctx.arc(0, 0, 14, 0, Math.PI * 2); ctx.strokeStyle = '#d9a441'; ctx.lineWidth = 2; ctx.stroke(); }
+      if (p.status === 'dead') {
+        ctx.strokeStyle = '#e0634f'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(-6, -6); ctx.lineTo(6, 6); ctx.moveTo(6, -6); ctx.lineTo(-6, 6); ctx.stroke();
+      } else if (p.status === 'sleeping') {
+        ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(20,23,26,.75)'; ctx.fill();
+        ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      } else {
+        if (p.heading >= 0) {
+          ctx.save(); ctx.rotate(p.heading * Math.PI / 180);
+          ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(5, -6); ctx.lineTo(-5, -6); ctx.closePath();
+          ctx.fillStyle = col; ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.fill(); ctx.stroke();
+          ctx.restore();
+        }
+        ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI * 2);
+        ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.stroke();
+      }
+      if ($('tNames').checked || isSel) {
+        const label = p.name + (p.status === 'sleeping' ? ' (zz)' : '');
+        ctx.font = '600 12px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+        outlinedText(label, 0, -16, p.status === 'online' ? '#fff' : '#c9c9c9');
+      }
+      ctx.restore();
+    }
+  }
+  function draw(now) {
+    const r = wrap.getBoundingClientRect();
+    ctx.clearRect(0, 0, r.width, r.height);
+    if (!mapImg) return;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(mapImg, view.ox, view.oy, mapImg.naturalWidth * view.s, mapImg.naturalHeight * view.s);
+    if ($('tGrid').checked) drawGrid(r);
+    if ($('tBases').checked) drawBases();
+    if ($('tMon').checked) drawMonuments();
+    if ($('tTrails').checked) drawTrails();
+    if ($('tDeaths').checked) drawDeaths();
+    drawPlayers(now);
+  }
+  let lastSlowDraw = 0;
+  function loop(now) {
+    let moving = false;
+    for (const e of players.values()) if (now - e.t0 < POLL_MS && (e.fromX !== e.toX || e.fromZ !== e.toZ)) moving = true;
+    if (follow && selected && moving) centerOn(selected, false);
+    // fading trails/deaths change slowly: redraw at least every 5 s
+    if (dirty || moving || now - lastSlowDraw > 5000) { draw(now); dirty = false; lastSlowDraw = now; }
+    footer();
+    requestAnimationFrame(loop);
+  }
+  let lastFoot = '';
+  function footer() {
+    let t = '&nbsp;';
+    if (lastData) {
+      const age = Math.round((Date.now() - lastUpdate) / 1000);
+      const h = lastData.hour, hh = Math.floor(h), mm = Math.floor((h - hh) * 60);
+      const online = lastData.players.filter(p => p.status !== 'sleeping').length;
+      t = online + ' online · ' + (lastData.players.length - online) + ' sleeping · in-game ' +
+        String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') +
+        ' · updated ' + (age <= 3 ? 'just now' : age + 's ago');
+    }
+    if (t !== lastFoot) { $('foot').innerHTML = t; lastFoot = t; }
+  }
+  requestAnimationFrame(loop);
+
+  // ---------- mouse ----------
+  let drag = null;
+  wrap.addEventListener('pointerdown', e => {
+    if (e.target.closest('#zoomBtns')) return;
+    drag = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy };
+    wrap.setPointerCapture(e.pointerId);
+  });
+  wrap.addEventListener('pointermove', e => {
+    if (drag) {
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 3) { wrap.classList.add('dragging'); follow = false; }
+      view.ox = drag.ox + dx; view.oy = drag.oy + dy; dirty = true;
+    }
+    hoverInfo(e);
+  });
+  wrap.addEventListener('pointerup', () => { drag = null; wrap.classList.remove('dragging'); });
+  wrap.addEventListener('pointerleave', () => { $('hover').style.display = 'none'; });
+  wrap.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = wrap.getBoundingClientRect();
+    zoomAt(e.deltaY < 0 ? 1.2 : 1 / 1.2, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  function zoomCenter(f) { const r = wrap.getBoundingClientRect(); zoomAt(f, r.width / 2, r.height / 2); }
+  $('zin').onclick = () => zoomCenter(1.5);
+  $('zout').onclick = () => zoomCenter(1 / 1.5);
+  $('zfit').onclick = () => { follow = false; fit(); };
+  for (const k of TOGGLES) $(k).onchange = () => { saveSettings(); dirty = true; };
+  $('trailLen').onchange = () => { saveSettings(); dirty = true; };
+
+  // tooltip: grid square, plus any death marker or base under the mouse
+  function hoverInfo(e) {
+    const h = $('hover');
+    if (!mapImg) { h.style.display = 'none'; return; }
+    const r = wrap.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const ix = (sx - view.ox) / view.s, iy = (sy - view.oy) / view.s;
+    const inner = mapImg.naturalWidth - 2 * mapInfo.margin, k = mapInfo.size / inner, half = mapInfo.size / 2;
+    const wx = (ix - mapInfo.margin) * k - half, wz = half - (iy - mapInfo.margin) * k;
+    if (Math.abs(wx) > half || Math.abs(wz) > half) { h.style.display = 'none'; return; }
+    const col = Math.floor((wx + half) / mapInfo.cell), row = Math.floor((half - wz) / mapInfo.cell);
+    h.innerHTML = '';
+    const line = (text, cls) => { const d = document.createElement('div'); d.textContent = text; if (cls) d.className = cls; h.appendChild(d); };
+    line(gridName(col) + row, 'g');
+    const near = metersToPx(1);
+    if ($('tDeaths').checked) {
+      const now = serverNow();
+      for (const x of deaths) {
+        if (now - x.time > DEATH_SHOW_SECONDS) continue;
+        if (Math.hypot(wx - x.x, wz - x.z) * near < 14) line('☠ ' + deathText(x) + ' · ' + ago(now - x.time));
+      }
+    }
+    if ($('tBases').checked) {
+      const pad = 6 / near; // a few pixels of slack around small bases
+      for (const b of bases) {
+        if (b.extraTc) continue;
+        if (wx < b.minX - pad || wx > b.maxX + pad || wz < b.minZ - pad || wz > b.maxZ + pad) continue;
+        const auth = b.auth.filter(a => isSteamId(a.id)).map(a => a.name);
+        line((b.playerOwned ? 'Base of ' + (b.owner || '?') : 'Unowned / event base') + ' · ' + b.blocks + ' building blocks' +
+          (auth.length ? ' · cupboard access: ' + auth.join(', ') : ''));
+      }
+    }
+    h.style.left = Math.min(sx + 14, r.width - 330) + 'px'; h.style.top = (sy + 14) + 'px'; h.style.display = 'block';
+  }
+
+  // Browsers block an https:// page from opening the plain ws:// connection that Rust's WebRCON uses.
+  if (location.protocol === 'https:') {
+    showMsg('This page must be opened from your own computer, not from a website. Download LiveMap.html, then double-click the file to open it.');
+    $('connectBtn').disabled = true;
+    return;
+  }
+
+  // connect straight away if the password was remembered
+  if ($('pw').value) connect();
+})();
+</script>
+</body>
+</html>
