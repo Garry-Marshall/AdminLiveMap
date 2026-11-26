@@ -90,6 +90,10 @@
     font-size: 13px; transition: opacity .5s; }
   .toast.join { border-color: var(--good); } .toast.leave { border-color: var(--muted); }
   .toast.death { border-color: var(--bad); } .toast.chat { border-color: #4fc3f7; }
+  #search { position: sticky; top: 0; z-index: 1; margin-bottom: 4px; }
+  #listNote, #busyNote { color: var(--muted); font-size: 12px; padding: 2px 4px; }
+  #listNote:empty, #busyNote:empty { display: none; }
+  #busyNote { padding: 6px 0 0; }
 </style>
 </head>
 <body>
@@ -146,6 +150,7 @@
         <label class="check"><input type="checkbox" id="tBases" checked> Bases</label>
         <label class="check"><input type="checkbox" id="tSound" checked> Sounds</label>
       </div>
+      <div id="busyNote"></div>
     </section>
 
     <div class="tabs">
@@ -153,7 +158,11 @@
       <div class="tab" data-pane="chat">Chat<span class="badge" id="chatBadge"></span></div>
       <div class="tab" data-pane="events">Events<span class="badge" id="evBadge"></span></div>
     </div>
-    <div class="pane on" id="pane-players"><div class="empty">No data yet.</div></div>
+    <div class="pane on" id="pane-players">
+      <input type="text" id="search" placeholder="Find a player (name or Steam ID)" autocomplete="off">
+      <div id="listNote"></div>
+      <div id="listBox"><div class="empty">No data yet.</div></div>
+    </div>
     <div class="pane" id="pane-chat"><div class="empty">No chat yet.</div></div>
     <div class="pane" id="pane-events"><div class="empty">Joins, leaves and deaths show up here.</div></div>
     <form id="chatForm" autocomplete="off">
@@ -167,29 +176,49 @@
 <script>
 (() => {
   'use strict';
-  const POLL_MS = 2000, INFO_MS = 5000, BASES_MS = 60000;
-  const ID = { map: 7001, players: 7002, trails: 7003, bases: 7004, info: 7005, chatTail: 7006, say: 7007 };
+  const POLL_MS = 2000, INFO_MS = 5000, BASES_MS = 60000, BASES_SCAN_MS = 5000;
+  const SLEEPERS_MIN_MS = 60000;   // ask for sleepers at most once a minute (only when they changed)
+  const STATIC_REFRESH_MS = 30000; // redraw fading deaths and trails at least this often
+  const QUIET_ABOVE = 30;          // more players online: no pop-ups or sounds for joins, leaves, deaths and chat
+  const ALL_TRAILS_MAX = 50;       // more players online: only the selected player's trail
+  const NAMES_ZOOM_ABOVE = 60;     // more players online: names only when zoomed in
+  const MANY_MARKERS = 1500;       // more sleepers or bases: small squares when zoomed out
+  const LIST_MAX = 100;            // player list rows shown at once
+  const GRID_CELL = 1024 / 7;
+  const ID = { map: 7001, players: 7002, trails: 7003, bases: 7004, info: 7005, chatTail: 7006, say: 7007,
+    sleepers: 7008, deaths: 7009, trail: 7010 };
   const TEAM_COLORS = ['#4fc3f7', '#f06292', '#aed581', '#ffb74d', '#ba68c8', '#4db6ac', '#fff176', '#90a4ae', '#ff8a65', '#7986cb'];
   const DEATH_SHOW_SECONDS = 60 * 60;
   const TOGGLES = ['tGrid', 'tMon', 'tSleep', 'tNames', 'tTrails', 'tDeaths', 'tBases', 'tSound'];
 
   const $ = id => document.getElementById(id);
   const cv = $('cv'), ctx = cv.getContext('2d'), wrap = $('mapWrap');
+  // Everything that rarely changes (map, grid, bases, sleepers, deaths, trails) is drawn on a hidden layer,
+  // so each animation frame only copies that layer and draws the online players on top.
+  const layer = document.createElement('canvas'), lctx = layer.getContext('2d');
+  let g = ctx; // the canvas being drawn on right now
+  const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
 
   // ---------- state ----------
-  let ws = null, wantConnected = false, timers = [], retryTimer = null;
-  let mapInfo = null, mapImg = null;
-  let players = new Map();          // id -> {data, fromX, fromZ, toX, toZ, t0}
-  let lastData = null, lastUpdate = 0, firstPlayers = true;
+  let ws = null, wantConnected = false, timers = [], retryTimer = null, basesTimer = null;
+  let mapInfo = null, mapImg = null, worldSize = 0;
+  let online = new Map();           // id -> {data, fromX, fromZ, toX, toZ, t0}
+  let sleepers = new Map();         // id -> data
+  let sleepersSorted = null;        // cached sorted list for the player list
+  let teamLeaders = {};             // teamId -> leader steamId
+  let sleepersVersion = -1, sleepersAskedAt = 0, sleepersPending = false, sleeperCount = 0;
+  let lastData = null, lastUpdate = 0, firstPlayers = true, quiet = false;
   let serverOffset = 0;             // server unix seconds - local unix seconds
   let trails = new Map();           // id -> [[t,x,z], ...]
-  let deaths = [], seenDeaths = new Set();
-  let bases = [];
+  let trailKeepSec = 3600, trailStep = 1, fullTrails = new Set();
+  let deaths = [], lastDeath = 0, deathsPending = false, deathsLoaded = false;
+  let bases = [], basesByOwner = new Map(), basesComplete = true, basesProgress = '';
   let chat = [], events = [];
   let activePane = 'players', unread = { chat: 0, events: 0 };
   let selected = null, follow = false;
   let view = { s: 0.3, ox: 0, oy: 0 }; // screen = img * s + o
-  let dirty = true;
+  let W = 0, H = 0, dpr = 1;
+  let dirty = true, staticDirty = true, listDirty = true, chatDirty = false, eventsDirty = false;
 
   // ---------- saved settings (stay in this browser only) ----------
   try {
@@ -210,7 +239,7 @@
   // ---------- connection ----------
   function setStatus(kind, text) { $('stDot').className = 'dot ' + kind; $('stText').textContent = text; }
   function showMsg(t) { $('msg').textContent = t || ''; }
-  function stopTimers() { timers.forEach(clearInterval); timers = []; }
+  function stopTimers() { timers.forEach(clearInterval); timers = []; clearTimeout(basesTimer); basesTimer = null; }
 
   function connect() {
     const host = $('host').value.trim(), port = $('port').value.trim(), pw = $('pw').value;
@@ -230,15 +259,17 @@
       $('connBox').style.display = 'none';
       $('discBtn').style.display = 'block';
       showMsg(mapImg ? '' : 'Loading map image...');
+      // after a reconnect: ask for everything again, but don't announce everyone as joined
+      firstPlayers = true; sleepersVersion = -1; sleepersPending = false; deathsPending = false;
+      fullTrails.clear();
       if (!mapImg) send('livemap.mapdata', ID.map);
       send('livemap.trails', ID.trails);
       send('chat.tail 50', ID.chatTail);
       const poll = () => send('livemap.players', ID.players);
       const info = () => send('serverinfo', ID.info);
-      const bas = () => send('livemap.bases', ID.bases);
-      poll(); info(); bas();
+      poll(); info(); askBases();
       stopTimers();
-      timers.push(setInterval(poll, POLL_MS), setInterval(info, INFO_MS), setInterval(bas, BASES_MS));
+      timers.push(setInterval(poll, POLL_MS), setInterval(info, INFO_MS), setInterval(askBases, BASES_MS));
     };
     ws.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -253,10 +284,12 @@
       switch (m.Identifier) {
         case ID.map: if (d.type === 'map') loadMap(d); else if (d.type === 'error') showMsg(d.message); break;
         case ID.players: if (d.type === 'players') updatePlayers(d); break;
-        case ID.trails: if (d.type === 'trails') loadTrails(d); break;
-        case ID.bases: if (d.type === 'bases') { bases = d.bases; dirty = true; } break;
+        case ID.sleepers: if (d.type === 'sleepers') loadSleepers(d); break;
+        case ID.deaths: if (d.type === 'deaths') loadDeaths(d); break;
+        case ID.trails: case ID.trail: if (d.type === 'trails' || d.type === 'trail') loadTrails(d); break;
+        case ID.bases: if (d.type === 'bases') loadBases(d); break;
         case ID.info: updateHealth(d); break;
-        case ID.chatTail: if (Array.isArray(d)) { chat = []; d.forEach(c => addChat(c, false)); renderChat(); } break;
+        case ID.chatTail: if (Array.isArray(d)) { chat = []; d.forEach(c => addChat(c, false)); chatDirty = true; } break;
       }
     };
     ws.onclose = () => {
@@ -284,6 +317,7 @@
   function send(cmd, id) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ Identifier: id, Message: cmd, Name: 'LiveMap' }));
   }
+  function askBases() { if ($('tBases').checked) send('livemap.bases', ID.bases); }
   $('connectBtn').onclick = connect;
   $('discBtn').onclick = disconnect;
   $('pw').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
@@ -323,21 +357,22 @@
   function i2s(px, py) { return [px * view.s + view.ox, py * view.s + view.oy]; }
   function w2s(x, z) { const p = w2i(x, z); return i2s(p[0], p[1]); }
   function metersToPx(m) { return m * (mapImg.naturalWidth - 2 * mapInfo.margin) / mapInfo.size * view.s; }
+  function onScreen(p, pad) { return p[0] > -pad && p[1] > -pad && p[0] < W + pad && p[1] < H + pad; }
+  function viewChanged() { staticDirty = true; dirty = true; }
 
   function resize() {
-    const r = wrap.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-    cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    dirty = true;
+    const r = wrap.getBoundingClientRect();
+    dpr = window.devicePixelRatio || 1; W = r.width; H = r.height;
+    cv.width = layer.width = Math.round(W * dpr); cv.height = layer.height = Math.round(H * dpr);
+    viewChanged();
   }
   function fit() {
     if (!mapImg) return;
-    const r = wrap.getBoundingClientRect();
-    const s = Math.min(r.width, r.height) / mapImg.naturalWidth * 0.98;
+    const s = Math.min(W, H) / mapImg.naturalWidth * 0.98;
     view.s = s;
-    view.ox = (r.width - mapImg.naturalWidth * s) / 2;
-    view.oy = (r.height - mapImg.naturalHeight * s) / 2;
-    dirty = true;
+    view.ox = (W - mapImg.naturalWidth * s) / 2;
+    view.oy = (H - mapImg.naturalHeight * s) / 2;
+    viewChanged();
   }
   function zoomAt(f, sx, sy) {
     const ns = Math.max(0.05, Math.min(6, view.s * f));
@@ -345,16 +380,22 @@
     view.ox = sx - (sx - view.ox) * f;
     view.oy = sy - (sy - view.oy) * f;
     view.s = ns;
-    dirty = true;
+    viewChanged();
   }
   window.addEventListener('resize', resize);
   resize();
 
   // ---------- helpers ----------
+  const colorCache = new Map();
   function colorFor(team, id) {
     const key = team || id || '';
-    let h = 0; for (const c of key) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    return TEAM_COLORS[h % TEAM_COLORS.length];
+    let c = colorCache.get(key);
+    if (!c) {
+      let h = 0; for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+      c = TEAM_COLORS[h % TEAM_COLORS.length];
+      colorCache.set(key, c);
+    }
+    return c;
   }
   function serverNow() { return Date.now() / 1000 + serverOffset; }
   function clock(unix) {
@@ -368,6 +409,19 @@
     return Math.floor(sec / 3600) + 'h ' + Math.round(sec % 3600 / 60) + 'm ago';
   }
   function isSteamId(id) { return /^7656\d{13}$/.test(id); }
+  function gridName(col) {
+    let s = ''; col += 1;
+    while (col > 0) { const m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = Math.floor((col - 1) / 26); }
+    return s;
+  }
+  function gridOf(x, z) {
+    const size = mapInfo ? mapInfo.size : worldSize;
+    if (!size) return '';
+    const half = size / 2, col = Math.floor((x + half) / GRID_CELL), row = Math.floor((half - z) / GRID_CELL);
+    return col < 0 || row < 0 ? '' : gridName(col) + row;
+  }
+  function playerData(id) { const e = online.get(id); return e ? e.data : sleepers.get(id); }
+  function fmt(n) { return n.toLocaleString(); }
 
   // ---------- sounds ----------
   let audio = null;
@@ -378,11 +432,11 @@
       const notes = { join: [523, 784], leave: [523, 392], death: [196, 147], chat: [880] }[kind] || [660];
       let t = audio.currentTime;
       for (const f of notes) {
-        const o = audio.createOscillator(), g = audio.createGain();
+        const o = audio.createOscillator(), gn = audio.createGain();
         o.frequency.value = f; o.type = kind === 'death' ? 'triangle' : 'sine';
-        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
-        o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.2);
+        gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
+        gn.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+        o.connect(gn).connect(audio.destination); o.start(t); o.stop(t + 0.2);
         t += 0.13;
       }
     } catch (e) {}
@@ -396,23 +450,29 @@
     while ($('toasts').children.length > 5) $('toasts').lastChild.remove();
     setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 600); }, 6000);
   }
-  function addEvent(kind, text, time, pos, live) {
-    events.push({ kind, text, time, pos });
-    events.sort((a, b) => a.time - b.time);
+  // isNew: it happened while the page was open. On busy servers it is listed without a pop-up or sound.
+  function addEvent(kind, text, time, pos, isNew) {
+    const e = { kind, text, time, pos };
+    let i = events.length;
+    while (i > 0 && events[i - 1].time > time) i--;
+    events.splice(i, 0, e);
     if (events.length > 300) events.shift();
-    if (live) {
-      toast(kind, text); beep(kind);
+    if (isNew) {
+      if (!quiet) { toast(kind, text); beep(kind); }
       if (activePane !== 'events') unread.events++;
     }
-    renderEvents();
+    eventsDirty = true;
   }
   function renderEvents() {
-    const box = $('pane-events');
+    eventsDirty = false;
     $('evBadge').textContent = unread.events || '';
+    if (activePane !== 'events') return;
+    const box = $('pane-events');
     if (!events.length) { box.innerHTML = '<div class="empty">Joins, leaves and deaths show up here.</div>'; return; }
     const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
     box.innerHTML = '';
     const icons = { join: '▶', leave: '◀', death: '☠' };
+    const frag = document.createDocumentFragment();
     for (const e of events) {
       const el = document.createElement('div');
       el.className = 'ev ' + e.kind + (e.pos ? ' click' : '');
@@ -421,8 +481,9 @@
       el.querySelector('.ic').textContent = icons[e.kind] || '•';
       el.querySelector('.tx').textContent = e.text;
       if (e.pos) { el.title = 'Show on map'; el.onclick = () => { follow = false; centerOnWorld(e.pos[0], e.pos[1], true); }; }
-      box.appendChild(el);
+      frag.appendChild(el);
     }
+    box.appendChild(frag);
     if (stick) box.scrollTop = box.scrollHeight;
   }
 
@@ -432,17 +493,21 @@
     if (!c || typeof c.Message !== 'string') return;
     chat.push({ time: c.Time, name: c.Username, msg: c.Message, channel: c.Channel, color: c.Color, server: c.Channel === 2 || c.UserId === '0' });
     if (chat.length > 300) chat.shift();
-    if (live) {
-      if (activePane !== 'chat') { unread.chat++; toast('chat', c.Username + ': ' + c.Message); beep('chat'); }
-      renderChat();
+    if (live && activePane !== 'chat') {
+      unread.chat++;
+      if (!quiet) { toast('chat', c.Username + ': ' + c.Message); beep('chat'); }
     }
+    chatDirty = true;
   }
   function renderChat() {
-    const box = $('pane-chat');
+    chatDirty = false;
     $('chatBadge').textContent = unread.chat || '';
+    if (activePane !== 'chat') return;
+    const box = $('pane-chat');
     if (!chat.length) { box.innerHTML = '<div class="empty">No chat yet.</div>'; return; }
     const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
     box.innerHTML = '';
+    const frag = document.createDocumentFragment();
     for (const c of chat) {
       const el = document.createElement('div');
       el.className = 'chatLine' + (c.server ? ' server' : '');
@@ -453,9 +518,10 @@
       who.textContent = c.name + ':';
       if (!c.server && /^#[0-9a-f]{3,8}$/i.test(c.color || '')) who.style.color = c.color;
       el.querySelector('.m').textContent = c.msg;
-      box.appendChild(el);
+      frag.appendChild(el);
     }
-    if (stick || activePane !== 'chat') box.scrollTop = box.scrollHeight;
+    box.appendChild(frag);
+    if (stick) box.scrollTop = box.scrollHeight;
   }
   $('chatForm').addEventListener('submit', e => {
     e.preventDefault();
@@ -474,46 +540,90 @@
       $('chatForm').classList.toggle('on', activePane === 'chat');
       if (activePane === 'chat') { unread.chat = 0; renderChat(); $('pane-chat').scrollTop = 1e9; }
       if (activePane === 'events') { unread.events = 0; renderEvents(); $('pane-events').scrollTop = 1e9; }
+      if (activePane === 'players') renderList();
     };
   }
 
   // ---------- players ----------
   function updatePlayers(d) {
+    if (!Array.isArray(d.online)) {
+      showMsg('The Admin Live Map plugin on the server is older than this page. Please update AdminLiveMap.cs to version 1.1.0 or newer.');
+      return;
+    }
     if (typeof d.now === 'number') serverOffset = d.now - Date.now() / 1000;
+    worldSize = d.size;
+    Object.assign(teamLeaders, d.teams || {});
+    quiet = d.online.length > QUIET_ABOVE;
     const now = performance.now(), seen = new Set();
-    for (const p of d.players) {
-      if (seen.has(p.id)) continue; // never handle the same player twice in one update
+    for (const r of d.online) {
+      // [steamId, name, x, z, heading, health, flags, teamId, vehicle]
+      const p = { id: r[0], name: r[1], x: r[2], z: r[3], heading: r[4], health: r[5], flags: r[6], team: r[7], mounted: r[8] };
+      if (seen.has(p.id)) continue;
       seen.add(p.id);
-      const old = players.get(p.id);
-      if (!firstPlayers) {
-        const was = old ? old.data.status : null;
-        if (p.status === 'online' && was !== 'online' && was !== 'dead')
-          addEvent('join', p.name + (old ? ' joined' : ' joined for the first time'), d.now, [p.x, p.z], true);
-        if (old && (was === 'online' || was === 'dead') && p.status === 'sleeping')
-          addEvent('leave', p.name + ' left', d.now, [p.x, p.z], true);
-      }
+      p.status = p.flags & 2 ? 'dead' : 'online';
+      p.asleep = !!(p.flags & 1); // connected, but hasn't woken up yet
+      const old = online.get(p.id);
       if (old) {
         const cur = currentPos(old, now);
         const jump = Math.hypot(p.x - cur[0], p.z - cur[1]) > 300; // teleport / respawn: don't slide
         Object.assign(old, { data: p, fromX: jump ? p.x : cur[0], fromZ: jump ? p.z : cur[1], toX: p.x, toZ: p.z, t0: now });
       } else {
-        players.set(p.id, { data: p, fromX: p.x, fromZ: p.z, toX: p.x, toZ: p.z, t0: now });
+        online.set(p.id, { data: p, fromX: p.x, fromZ: p.z, toX: p.x, toZ: p.z, t0: now });
+        if (!firstPlayers) addEvent('join', p.name + ' joined', d.now, [p.x, p.z], true);
+        if (sleepers.delete(p.id)) { sleepersSorted = null; staticDirty = true; }
       }
       if (p.status === 'online') addTrailPoint(p.id, d.now, p.x, p.z);
     }
-    for (const id of [...players.keys()]) if (!seen.has(id)) players.delete(id);
-
-    deaths = d.deaths || [];
-    for (const x of deaths) {
-      if (seenDeaths.has(x.id)) continue;
-      seenDeaths.add(x.id);
-      addEvent('death', deathText(x), x.time, [x.x, x.z], !firstPlayers);
+    for (const [id, e] of online) {
+      if (seen.has(id)) continue;
+      online.delete(id);
+      if (!firstPlayers) addEvent('leave', e.data.name + ' left', d.now, [e.toX, e.toZ], true);
+      // they now sleep where they were; the next sleepers update confirms it
+      sleepers.set(id, Object.assign({}, e.data, { x: e.toX, z: e.toZ, status: 'sleeping', heading: -1, mounted: null, asleep: false }));
+      sleepersSorted = null;
+      staticDirty = true;
     }
+
+    sleeperCount = d.sleeperCount || 0;
+    const due = sleepersVersion < 0 || Date.now() - sleepersAskedAt > SLEEPERS_MIN_MS;
+    if (!sleepersPending && d.sleepersVersion !== sleepersVersion && due) {
+      sleepersPending = true; sleepersAskedAt = Date.now();
+      send('livemap.sleepers', ID.sleepers);
+    }
+    if (d.lastDeath < lastDeath) { lastDeath = 0; deaths = []; staticDirty = true; } // the server's death list was reset
+    if (d.lastDeath > lastDeath && !deathsPending) { deathsPending = true; send('livemap.deaths ' + lastDeath, ID.deaths); }
 
     firstPlayers = false;
     lastData = d; lastUpdate = Date.now();
-    renderList();
+    listDirty = true;
+    if ($('tTrails').checked) staticDirty = true; // trails grew
     dirty = true;
+    updateBusyNote();
+  }
+  function loadSleepers(d) {
+    sleepersPending = false;
+    sleepersVersion = d.version;
+    sleepers = new Map();
+    Object.assign(teamLeaders, d.teams || {});
+    for (const r of d.sleepers) {
+      // [steamId, name, x, z, health, flags, teamId]
+      if (online.has(r[0])) continue;
+      sleepers.set(r[0], { id: r[0], name: r[1], x: r[2], z: r[3], health: r[4], flags: r[5], team: r[6], status: 'sleeping', heading: -1 });
+    }
+    sleepersSorted = null; listDirty = true; staticDirty = true;
+  }
+  function loadDeaths(d) {
+    deathsPending = false;
+    for (const x of d.deaths) {
+      if (x.id <= lastDeath) continue;
+      deaths.push(x);
+      addEvent('death', deathText(x), x.time, [x.x, x.z], deathsLoaded);
+    }
+    lastDeath = Math.max(lastDeath, d.lastDeath);
+    deathsLoaded = true;
+    const cutoff = serverNow() - DEATH_SHOW_SECONDS;
+    deaths = deaths.filter(x => x.time >= cutoff);
+    staticDirty = true;
   }
   const DAMAGE_WORDS = { fall: 'fell to their death', bleeding: 'bled out', hunger: 'starved', thirst: 'died of thirst',
     cold: 'froze to death', heat: 'burned to death', drowned: 'drowned', radiationexposure: 'died of radiation',
@@ -548,16 +658,33 @@
     return [e.fromX + (e.toX - e.fromX) * t, e.fromZ + (e.toZ - e.fromZ) * t];
   }
   function visible(p) { return p.status !== 'sleeping' || $('tSleep').checked; }
+  function updateBusyNote() {
+    const parts = [];
+    if (quiet) parts.push('no pop-ups or sounds for joins, leaves, deaths and chat (they are still listed under Events)');
+    if (online.size > ALL_TRAILS_MAX) parts.push('trails only for the player you select');
+    if (online.size > NAMES_ZOOM_ABOVE) parts.push('names show when you zoom in');
+    const t = parts.length ? 'Busy server: ' + parts.join('; ') + '.' : '';
+    if ($('busyNote').textContent !== t) $('busyNote').textContent = t;
+  }
 
   // ---------- trails ----------
   function loadTrails(d) {
     if (typeof d.now === 'number') serverOffset = d.now - Date.now() / 1000;
-    for (const id in d.trails) {
-      const server = d.trails[id], mine = trails.get(id) || [];
-      const lastT = server.length ? server[server.length - 1][0] : 0;
-      trails.set(id, server.concat(mine.filter(p => p[0] > lastT)));
-    }
-    dirty = true;
+    if (d.type === 'trail') { mergeTrail(d.id, d.trail); fullTrails.add(d.id); staticDirty = true; return; }
+    trailKeepSec = (d.minutes || 60) * 60;
+    trailStep = d.step || 1;
+    for (const id in d.trails) mergeTrail(id, d.trails[id]);
+    if (trailStep === 1) for (const id in d.trails) fullTrails.add(id);
+    if (selected) askFullTrail(selected);
+    staticDirty = true;
+  }
+  function mergeTrail(id, flat) {
+    // the server sends [time, x, z, time, x, z, ...]; points collected by this page since then are kept
+    const server = [];
+    for (let i = 0; i + 2 < flat.length; i += 3) server.push([flat[i], flat[i + 1], flat[i + 2]]);
+    const mine = trails.get(id) || [];
+    const lastT = server.length ? server[server.length - 1][0] : 0;
+    trails.set(id, server.concat(mine.filter(p => p[0] > lastT)));
   }
   function addTrailPoint(id, t, x, z) {
     let tr = trails.get(id);
@@ -565,234 +692,397 @@
     const last = tr[tr.length - 1];
     if (last && Math.hypot(x - last[1], z - last[2]) < 3) return;
     tr.push([t, x, z]);
-    const cutoff = t - 3600;
-    while (tr.length && tr[0][0] < cutoff) tr.shift();
+    const cutoff = t - trailKeepSec;
+    let old = 0;
+    while (old < tr.length && tr[old][0] < cutoff) old++;
+    if (old) tr.splice(0, old);
+  }
+  function askFullTrail(id) {
+    // when the server thinned out trails, get the selected player's trail in full
+    if (trailStep > 1 && !fullTrails.has(id)) send('livemap.trails ' + id, ID.trail);
+  }
+  function trailIds() {
+    if (online.size <= ALL_TRAILS_MAX) return trails.keys();
+    return selected && trails.has(selected) ? [selected] : [];
   }
 
+  // ---------- bases ----------
+  function loadBases(d) {
+    const names = d.names || {};
+    bases = [];
+    basesByOwner = new Map();
+    for (const r of d.bases) {
+      // [cupboardId, x, z, ownerId, teamId, blocks, extraCupboard, minX, maxX, minZ, maxZ, [authorised]]
+      const b = { id: r[0], x: r[1], z: r[2], ownerId: r[3], team: r[4], blocks: r[5], extraTc: !!r[6],
+        minX: r[7], maxX: r[8], minZ: r[9], maxZ: r[10], auth: r[11] || [] };
+      b.playerOwned = !!b.ownerId && isSteamId(b.ownerId);
+      b.owner = b.ownerId ? names[b.ownerId] || b.ownerId : null;
+      b.authNames = b.auth.filter(isSteamId).map(a => names[a] || a);
+      b.color = b.playerOwned ? colorFor(b.team, b.ownerId) : '#9aa0a6';
+      bases.push(b);
+      if (b.playerOwned && !b.extraTc) basesByOwner.set(b.ownerId, (basesByOwner.get(b.ownerId) || 0) + 1);
+    }
+    basesComplete = d.complete !== false;
+    basesProgress = basesComplete || !d.total ? '' : 'measuring bases ' + Math.floor(100 * d.measured / d.total) + '%';
+    clearTimeout(basesTimer); basesTimer = null;
+    if (!basesComplete) basesTimer = setTimeout(askBases, BASES_SCAN_MS); // sizes still being measured
+    listDirty = true; staticDirty = true;
+  }
+
+  // ---------- player list ----------
   const STATUS_ORDER = { online: 0, dead: 1, sleeping: 2 };
+  function byStatusName(a, b) { return (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || collator.compare(a.name, b.name); }
+  let lastListRender = 0;
   function renderList() {
-    const box = $('pane-players');
-    const list = [...players.values()].map(e => e.data)
-      .sort((a, b) => (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || a.name.localeCompare(b.name));
-    if (!list.length) { box.innerHTML = '<div class="empty">No players on this server.</div>'; return; }
-    const names = {}; for (const p of list) names[p.id] = p.name;
+    listDirty = false;
+    if (activePane !== 'players') return;
+    lastListRender = performance.now();
+    const box = $('listBox'), q = $('search').value.trim().toLowerCase();
+    const onlineList = [...online.values()].map(e => e.data).sort(byStatusName);
+    if (!sleepersSorted) sleepersSorted = [...sleepers.values()].sort(byStatusName);
+    const match = p => !q || p.id === q || (p.name || '').toLowerCase().includes(q);
+    const rows = []; let total = 0;
+    for (const list of [onlineList, sleepersSorted]) for (const p of list) {
+      if (!match(p)) continue;
+      total++;
+      if (rows.length < LIST_MAX) rows.push(p);
+    }
+    const all = onlineList.length + sleepersSorted.length;
+    $('listNote').textContent = total > rows.length
+      ? 'Showing ' + rows.length + ' of ' + fmt(total) + (q ? ' matches' : ' players') + '. Type a name to find someone.'
+      : q ? fmt(total) + (total === 1 ? ' match' : ' matches') : '';
+    if (!all) { box.innerHTML = '<div class="empty">No players on this server.</div>'; return; }
+    if (!rows.length) { box.innerHTML = '<div class="empty">Nobody matches.</div>'; return; }
     box.innerHTML = '';
-    for (const p of list) {
+    const frag = document.createDocumentFragment();
+    for (const p of rows) {
       const el = document.createElement('div');
       el.className = 'p' + (p.id === selected ? ' sel' : '');
       const status = p.status === 'online' ? (p.asleep ? 'Online (still asleep)' : 'Online') : p.status === 'dead' ? 'Dead' : 'Sleeping (offline)';
       const parts = [status];
       if (p.status !== 'dead') parts.push(Math.round(p.health) + ' hp');
       if (p.mounted) parts.push('in ' + prettyVehicle(p.mounted));
-      if (p.team) parts.push('team' + (p.leader && names[p.leader] ? ' of ' + names[p.leader] : ''));
-      const nBases = bases.filter(b => b.ownerId === p.id && !b.extraTc).length;
+      if (p.team) {
+        const leader = playerData(teamLeaders[p.team]);
+        parts.push('team' + (leader ? ' of ' + leader.name : ''));
+      }
+      const nBases = basesByOwner.get(p.id) || 0;
       if (nBases) parts.push(nBases + (nBases === 1 ? ' base' : ' bases'));
       el.innerHTML = '<span class="sw"></span><span class="nm"></span><span class="gr"></span><span class="sub"></span>';
       const sw = el.querySelector('.sw'), col = colorFor(p.team, p.id);
       sw.style.background = p.status === 'online' ? col : 'transparent';
       sw.style.border = '2px solid ' + (p.status === 'dead' ? 'var(--bad)' : col);
       el.querySelector('.nm').textContent = p.name;
-      el.querySelector('.gr').textContent = p.grid;
+      el.querySelector('.gr').textContent = gridOf(p.x, p.z);
       el.querySelector('.sub').textContent = parts.join(' · ');
       el.onclick = () => {
-        if (selected === p.id && follow) { follow = false; selected = null; }
-        else { selected = p.id; follow = true; centerOn(p.id, true); }
-        renderList(); dirty = true;
+        if (selected === p.id) { follow = false; selected = null; }
+        else { selected = p.id; follow = online.has(p.id); centerOn(p.id, true); askFullTrail(p.id); }
+        renderList(); viewChanged();
       };
-      box.appendChild(el);
+      frag.appendChild(el);
     }
+    box.appendChild(frag);
   }
+  $('search').addEventListener('input', renderList);
   function prettyVehicle(s) {
     return s.replace(/\.entity$/, '').replace(/[._]/g, ' ').replace(/\b(seat|driver|passenger)\b/g, '').trim();
   }
   function centerOnWorld(x, z, zoomIn) {
     if (!mapImg) return;
-    const r = wrap.getBoundingClientRect();
     if (zoomIn && view.s < 0.8) view.s = 0.8;
     const ip = w2i(x, z);
-    view.ox = r.width / 2 - ip[0] * view.s;
-    view.oy = r.height / 2 - ip[1] * view.s;
-    dirty = true;
+    view.ox = W / 2 - ip[0] * view.s;
+    view.oy = H / 2 - ip[1] * view.s;
+    viewChanged();
   }
   function centerOn(id, zoomIn) {
-    const e = players.get(id); if (!e) return;
-    const pos = currentPos(e, performance.now());
-    centerOnWorld(pos[0], pos[1], zoomIn);
+    const e = online.get(id);
+    if (e) { const pos = currentPos(e, performance.now()); centerOnWorld(pos[0], pos[1], zoomIn); return; }
+    const s = sleepers.get(id);
+    if (s) centerOnWorld(s.x, s.z, zoomIn);
   }
 
   // ---------- drawing ----------
-  function gridName(col) {
-    let s = ''; col += 1;
-    while (col > 0) { const m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = Math.floor((col - 1) / 26); }
-    return s;
-  }
   function outlinedText(text, x, y, fill) {
-    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(text, x, y);
-    ctx.fillStyle = fill; ctx.fillText(text, x, y);
+    g.lineWidth = 3; g.strokeStyle = 'rgba(0,0,0,.75)'; g.strokeText(text, x, y);
+    g.fillStyle = fill; g.fillText(text, x, y);
   }
-  function drawGrid(r) {
+  function fillSquares(buckets, size) {
+    // many small markers: one path per colour is far faster than one drawing call each
+    const h = size / 2;
+    for (const [col, pts] of buckets) {
+      g.beginPath();
+      for (const p of pts) g.rect(p[0] - h, p[1] - h, size, size);
+      g.fillStyle = col; g.fill();
+      g.lineWidth = 1; g.strokeStyle = 'rgba(0,0,0,.6)'; g.stroke();
+    }
+  }
+  function bucket(map, col, p) { let a = map.get(col); if (!a) map.set(col, a = []); a.push(p); }
+  function drawGrid() {
     const half = mapInfo.size / 2, cell = mapInfo.cell, n = Math.ceil(mapInfo.size / cell);
     const a = w2s(-half, half), b = w2s(half, -half);
     const cellPx = (b[0] - a[0]) / (mapInfo.size / cell);
-    ctx.strokeStyle = 'rgba(0,0,0,.28)'; ctx.lineWidth = 1;
-    ctx.beginPath();
+    g.strokeStyle = 'rgba(0,0,0,.28)'; g.lineWidth = 1;
+    g.beginPath();
     for (let i = 0; i <= n; i++) {
       const x = Math.round(Math.min(b[0], a[0] + i * cellPx)) + .5, y = Math.round(Math.min(b[1], a[1] + i * cellPx)) + .5;
-      ctx.moveTo(x, a[1]); ctx.lineTo(x, b[1]);
-      ctx.moveTo(a[0], y); ctx.lineTo(b[0], y);
+      g.moveTo(x, a[1]); g.lineTo(x, b[1]);
+      g.moveTo(a[0], y); g.lineTo(b[0], y);
     }
-    ctx.stroke();
+    g.stroke();
     if (cellPx > 26) {
-      ctx.font = '600 ' + Math.min(13, Math.max(9, cellPx / 6)) + 'px Segoe UI, sans-serif';
-      ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+      g.font = '600 ' + Math.min(13, Math.max(9, cellPx / 6)) + 'px Segoe UI, sans-serif';
+      g.fillStyle = 'rgba(0,0,0,.55)'; g.textBaseline = 'top'; g.textAlign = 'left';
       for (let c = 0; c < n; c++) for (let rw = 0; rw < n; rw++) {
         const x = a[0] + c * cellPx, y = a[1] + rw * cellPx;
-        if (x > r.width || y > r.height || x + cellPx < 0 || y + cellPx < 0) continue;
-        ctx.fillText(gridName(c) + rw, x + 3, y + 2);
+        if (x > W || y > H || x + cellPx < 0 || y + cellPx < 0) continue;
+        g.fillText(gridName(c) + rw, x + 3, y + 2);
       }
     }
   }
   function drawMonuments() {
-    ctx.font = '600 ' + (view.s > 0.45 ? 12 : 10) + 'px Segoe UI, sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    g.font = '600 ' + (view.s > 0.45 ? 12 : 10) + 'px Segoe UI, sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
     for (const m of mapInfo.monuments || []) {
       if (view.s < 0.25 && /cave|tunnel|entrance|well|lake|oasis|swamp|power line/i.test(m.name)) continue;
       const p = w2s(m.x, m.z);
-      outlinedText(m.name, p[0], p[1], '#f3ead2');
+      if (onScreen(p, 100)) outlinedText(m.name, p[0], p[1], '#f3ead2');
     }
   }
   function drawBases() {
+    const many = bases.length > MANY_MARKERS, small = new Map(), labelZoom = many ? 1.5 : 0.35;
+    g.font = '600 11px Segoe UI, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'top';
     for (const b of bases) {
-      const owned = b.playerOwned, col = owned ? colorFor(b.team, b.ownerId) : '#9aa0a6';
       const p1 = w2s(b.minX, b.maxZ), p2 = w2s(b.maxX, b.minZ);
+      if (p2[0] < -60 || p1[0] > W + 60 || p2[1] < -60 || p1[1] > H + 60) continue;
       let w = p2[0] - p1[0], h = p2[1] - p1[1];
       const cx = (p1[0] + p2[0]) / 2, cy = (p1[1] + p2[1]) / 2;
-      if (w < 8) { w = 8; } if (h < 8) { h = 8; }
-      ctx.save();
-      ctx.globalAlpha = 0.22; ctx.fillStyle = col; ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
-      ctx.globalAlpha = 0.95; ctx.strokeStyle = col; ctx.lineWidth = 2;
-      if (!owned) ctx.setLineDash([4, 3]);
-      ctx.strokeRect(cx - w / 2, cy - h / 2, w, h);
-      ctx.setLineDash([]);
+      if (many && w < 8 && h < 8) { if (!b.extraTc) bucket(small, b.color, [cx, cy]); continue; }
+      if (w < 8) w = 8; if (h < 8) h = 8;
+      g.globalAlpha = 0.22; g.fillStyle = b.color; g.fillRect(cx - w / 2, cy - h / 2, w, h);
+      g.globalAlpha = 0.95; g.strokeStyle = b.color; g.lineWidth = 2;
+      if (!b.playerOwned) g.setLineDash([4, 3]);
+      g.strokeRect(cx - w / 2, cy - h / 2, w, h);
+      if (!b.playerOwned) g.setLineDash([]);
       // cupboard icon
       const t = w2s(b.x, b.z);
-      ctx.fillStyle = '#111'; ctx.fillRect(t[0] - 3.5, t[1] - 3.5, 7, 7);
-      ctx.fillStyle = col; ctx.fillRect(t[0] - 2.5, t[1] - 2.5, 5, 5);
-      if (view.s > 0.35 && !b.extraTc) {
-        ctx.font = '600 11px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-        outlinedText(owned ? (b.owner || 'base') : 'event / unowned', cx, cy + h / 2 + 2, owned ? col : '#c9c9c9');
-      }
-      ctx.restore();
+      g.fillStyle = '#111'; g.fillRect(t[0] - 3.5, t[1] - 3.5, 7, 7);
+      g.fillStyle = b.color; g.fillRect(t[0] - 2.5, t[1] - 2.5, 5, 5);
+      if (view.s > labelZoom && !b.extraTc)
+        outlinedText(b.playerOwned ? (b.owner || 'base') : 'event / unowned', cx, cy + h / 2 + 2, b.playerOwned ? b.color : '#c9c9c9');
     }
+    g.globalAlpha = 0.9;
+    fillSquares(small, 5);
+    g.globalAlpha = 1;
   }
-  function drawTrails() {
-    const len = Number($('trailLen').value) * 60, now = serverNow();
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (const [id, tr] of trails) {
-      const e = players.get(id);
-      if (e && !visible(e.data)) continue;
-      const col = e ? colorFor(e.data.team, id) : colorFor(null, id);
-      // collect visible segments: [x1, y1, x2, y2, alpha]
-      const segs = [];
-      let prev = null;
-      for (const pt of tr) {
-        const age = now - pt[0];
-        if (age > len) { prev = null; continue; }
-        if (prev && Math.hypot(pt[1] - prev[1], pt[2] - prev[2]) < 300 && pt[0] - prev[0] < 180) {
-          const a = w2s(prev[1], prev[2]), b = w2s(pt[1], pt[2]);
-          segs.push([a[0], a[1], b[0], b[1], 0.3 + 0.7 * (1 - age / len)]);
-        }
-        prev = pt;
-      }
-      // join the last point to where the player is drawn right now
-      if (prev && e && e.data.status === 'online') {
-        const cur = currentPos(e, performance.now());
-        if (Math.hypot(cur[0] - prev[1], cur[1] - prev[2]) < 300) {
-          const a = w2s(prev[1], prev[2]), b = w2s(cur[0], cur[1]);
-          segs.push([a[0], a[1], b[0], b[1], 1]);
-        }
-      }
-      // dark outline first, then the coloured line on top
-      for (const [width, style, k] of [[6, 'rgba(0,0,0,1)', 0.55], [3, col, 1]]) {
-        ctx.lineWidth = width; ctx.strokeStyle = style;
-        for (const s of segs) {
-          ctx.globalAlpha = s[4] * k;
-          ctx.beginPath(); ctx.moveTo(s[0], s[1]); ctx.lineTo(s[2], s[3]); ctx.stroke();
-        }
-      }
+  function drawSleepers() {
+    const many = sleepers.size > MANY_MARKERS && view.s < 0.6, small = new Map();
+    const names = $('tNames').checked && (sleepers.size < 200 || view.s > (sleepers.size > MANY_MARKERS ? 1.5 : 0.8));
+    g.font = '600 12px Segoe UI, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'bottom';
+    for (const p of sleepers.values()) {
+      if (p.id === selected) continue; // drawn on top with the online players
+      const sp = w2s(p.x, p.z);
+      if (!onScreen(sp, 40)) continue;
+      const col = colorFor(p.team, p.id);
+      if (many) { bucket(small, col, sp); continue; }
+      g.beginPath(); g.arc(sp[0], sp[1], 6, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(20,23,26,.75)'; g.fill();
+      g.strokeStyle = col; g.lineWidth = 2; g.stroke();
+      if (names) outlinedText(p.name + ' (zz)', sp[0], sp[1] - 9, '#c9c9c9');
     }
-    ctx.globalAlpha = 1;
+    fillSquares(small, 3);
   }
   function drawDeaths() {
     const now = serverNow();
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = '12px Segoe UI Symbol, Segoe UI, sans-serif';
     for (const x of deaths) {
       const age = now - x.time;
       if (age > DEATH_SHOW_SECONDS) continue;
       const p = w2s(x.x, x.z);
-      ctx.globalAlpha = 0.45 + 0.55 * (1 - age / DEATH_SHOW_SECONDS);
-      ctx.beginPath(); ctx.arc(p[0], p[1], 8, 0, Math.PI * 2);
-      ctx.fillStyle = '#2a1512'; ctx.fill(); ctx.strokeStyle = '#e0634f'; ctx.lineWidth = 1.5; ctx.stroke();
-      ctx.font = '12px Segoe UI Symbol, Segoe UI, sans-serif'; ctx.fillStyle = '#f2d0c8';
-      ctx.fillText('☠', p[0], p[1] + 0.5);
+      if (!onScreen(p, 20)) continue;
+      g.globalAlpha = 0.45 + 0.55 * (1 - age / DEATH_SHOW_SECONDS);
+      g.beginPath(); g.arc(p[0], p[1], 8, 0, Math.PI * 2);
+      g.fillStyle = '#2a1512'; g.fill(); g.strokeStyle = '#e0634f'; g.lineWidth = 1.5; g.stroke();
+      g.fillStyle = '#f2d0c8';
+      g.fillText('☠', p[0], p[1] + 0.5);
     }
-    ctx.globalAlpha = 1;
+    g.globalAlpha = 1;
   }
-  function drawPlayers(now) {
-    const order = [...players.values()].sort((a, b) => STATUS_ORDER[b.data.status] - STATUS_ORDER[a.data.status]);
-    for (const e of order) {
-      const p = e.data; if (!visible(p)) continue;
-      const pos = currentPos(e, now), sp = w2s(pos[0], pos[1]);
-      const col = colorFor(p.team, p.id), isSel = p.id === selected;
-      ctx.save(); ctx.translate(sp[0], sp[1]);
-      if (isSel) { ctx.beginPath(); ctx.arc(0, 0, 14, 0, Math.PI * 2); ctx.strokeStyle = '#d9a441'; ctx.lineWidth = 2; ctx.stroke(); }
-      if (p.status === 'dead') {
-        ctx.strokeStyle = '#e0634f'; ctx.lineWidth = 3;
-        ctx.beginPath(); ctx.moveTo(-6, -6); ctx.lineTo(6, 6); ctx.moveTo(6, -6); ctx.lineTo(-6, 6); ctx.stroke();
-      } else if (p.status === 'sleeping') {
-        ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(20,23,26,.75)'; ctx.fill();
-        ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
-      } else {
-        if (p.heading >= 0) {
-          ctx.save(); ctx.rotate(p.heading * Math.PI / 180);
-          ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(5, -6); ctx.lineTo(-5, -6); ctx.closePath();
-          ctx.fillStyle = col; ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5; ctx.fill(); ctx.stroke();
-          ctx.restore();
+  function drawTrails() {
+    const len = Number($('trailLen').value) * 60, now = serverNow();
+    g.lineCap = 'round'; g.lineJoin = 'round';
+    for (const id of trailIds()) {
+      const tr = trails.get(id), p = playerData(id);
+      if (!tr || (p && !visible(p))) continue;
+      const col = colorFor(p ? p.team : null, id);
+      const k = fullTrails.has(id) ? 1 : trailStep; // thinned-out trails have bigger gaps between points
+      // segments grouped by age, so older parts fade out with few drawing calls
+      const groups = [[], [], [], [], []];
+      let prev = null;
+      for (const pt of tr) {
+        const age = now - pt[0];
+        if (age > len) { prev = null; continue; }
+        if (prev && Math.hypot(pt[1] - prev[1], pt[2] - prev[2]) < 300 * k && pt[0] - prev[0] < 180 * k) {
+          const a = w2s(prev[1], prev[2]), b = w2s(pt[1], pt[2]);
+          groups[Math.min(4, Math.floor((1 - age / len) * 5))].push(a[0], a[1], b[0], b[1]);
         }
-        ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI * 2);
-        ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.stroke();
+        prev = pt;
       }
-      if ($('tNames').checked || isSel) {
-        const label = p.name + (p.status === 'sleeping' ? ' (zz)' : '');
-        ctx.font = '600 12px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-        outlinedText(label, 0, -16, p.status === 'online' ? '#fff' : '#c9c9c9');
+      for (const [width, style, f] of [[6, '#000', 0.55], [3, col, 1]]) {
+        g.lineWidth = width; g.strokeStyle = style;
+        groups.forEach((s, i) => {
+          if (!s.length) return;
+          g.globalAlpha = (0.3 + 0.7 * (i + 0.5) / 5) * f;
+          g.beginPath();
+          for (let j = 0; j < s.length; j += 4) { g.moveTo(s[j], s[j + 1]); g.lineTo(s[j + 2], s[j + 3]); }
+          g.stroke();
+        });
       }
-      ctx.restore();
     }
+    g.globalAlpha = 1;
+  }
+  function drawTrailTails(now) {
+    // join each trail's last point to where the player is drawn right now
+    g.lineCap = 'round';
+    for (const id of trailIds()) {
+      const e = online.get(id), tr = trails.get(id);
+      if (!e || e.data.status !== 'online' || !tr || !tr.length) continue;
+      const last = tr[tr.length - 1], cur = currentPos(e, now);
+      if (Math.hypot(cur[0] - last[1], cur[1] - last[2]) > 300) continue;
+      const a = w2s(last[1], last[2]), b = w2s(cur[0], cur[1]);
+      for (const [width, style, alpha] of [[6, '#000', 0.55], [3, colorFor(e.data.team, id), 1]]) {
+        g.globalAlpha = alpha; g.lineWidth = width; g.strokeStyle = style;
+        g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+      }
+    }
+    g.globalAlpha = 1;
+  }
+  function drawMarker(p, sp, isSel, showName) {
+    const col = colorFor(p.team, p.id);
+    g.save(); g.translate(sp[0], sp[1]);
+    if (isSel) { g.beginPath(); g.arc(0, 0, 14, 0, Math.PI * 2); g.strokeStyle = '#d9a441'; g.lineWidth = 2; g.stroke(); }
+    if (p.status === 'dead') {
+      g.strokeStyle = '#e0634f'; g.lineWidth = 3;
+      g.beginPath(); g.moveTo(-6, -6); g.lineTo(6, 6); g.moveTo(6, -6); g.lineTo(-6, 6); g.stroke();
+    } else if (p.status === 'sleeping') {
+      g.beginPath(); g.arc(0, 0, 6, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(20,23,26,.75)'; g.fill();
+      g.strokeStyle = col; g.lineWidth = 2; g.stroke();
+    } else {
+      if (p.heading >= 0) {
+        g.save(); g.rotate(p.heading * Math.PI / 180);
+        g.beginPath(); g.moveTo(0, -15); g.lineTo(5, -6); g.lineTo(-5, -6); g.closePath();
+        g.fillStyle = col; g.strokeStyle = '#111'; g.lineWidth = 1.5; g.fill(); g.stroke();
+        g.restore();
+      }
+      g.beginPath(); g.arc(0, 0, 7, 0, Math.PI * 2);
+      g.fillStyle = col; g.fill(); g.strokeStyle = '#111'; g.lineWidth = 2; g.stroke();
+    }
+    if (showName || isSel) {
+      g.font = '600 12px Segoe UI, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'bottom';
+      outlinedText(p.name + (p.status === 'sleeping' ? ' (zz)' : ''), 0, -16, p.status === 'online' ? '#fff' : '#c9c9c9');
+    }
+    g.restore();
+  }
+  function drawOnline(now) {
+    const names = $('tNames').checked && (online.size <= NAMES_ZOOM_ABOVE || view.s > 0.6);
+    let sel = null;
+    // one path per team colour instead of one drawing call per player
+    const byColor = new Map(), dead = [], labels = [];
+    for (const e of online.values()) {
+      const p = e.data, pos = currentPos(e, now), sp = w2s(pos[0], pos[1]);
+      if (p.id === selected) { sel = [p, sp]; continue; }
+      if (!onScreen(sp, 40)) continue;
+      if (p.status === 'dead') dead.push(sp); else bucket(byColor, colorFor(p.team, p.id), [sp[0], sp[1], p.heading]);
+      if (names) labels.push([p, sp]);
+    }
+    if (dead.length) {
+      g.strokeStyle = '#e0634f'; g.lineWidth = 3; g.beginPath();
+      for (const [x, y] of dead) { g.moveTo(x - 6, y - 6); g.lineTo(x + 6, y + 6); g.moveTo(x + 6, y - 6); g.lineTo(x - 6, y + 6); }
+      g.stroke();
+    }
+    g.lineWidth = 1.5; g.strokeStyle = '#111';
+    // busy server seen from far away: small dots without arrows, so the map stays readable
+    const compact = online.size > 100 && view.s < 0.35;
+    for (const [col, pts] of byColor) {
+      g.fillStyle = col;
+      if (compact) {
+        g.beginPath();
+        for (const [x, y] of pts) { g.moveTo(x + 4, y); g.arc(x, y, 4, 0, Math.PI * 2); }
+        g.lineWidth = 1.5; g.fill(); g.stroke();
+        continue;
+      }
+      g.beginPath(); // view direction arrows, under the dots
+      for (const [x, y, hd] of pts) {
+        if (hd < 0) continue;
+        const a = hd * Math.PI / 180, s = Math.sin(a), c = Math.cos(a);
+        g.moveTo(x + 15 * s, y - 15 * c); g.lineTo(x + 5 * c + 6 * s, y + 5 * s - 6 * c); g.lineTo(x - 5 * c + 6 * s, y - 5 * s - 6 * c); g.closePath();
+      }
+      g.lineWidth = 1.5; g.fill(); g.stroke();
+      g.beginPath();
+      for (const [x, y] of pts) { g.moveTo(x + 7, y); g.arc(x, y, 7, 0, Math.PI * 2); }
+      g.lineWidth = 2; g.fill(); g.stroke();
+    }
+    if (labels.length) {
+      g.font = '600 12px Segoe UI, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'bottom';
+      for (const [p, sp] of labels) outlinedText(p.name, sp[0], sp[1] - 16, p.status === 'online' ? '#fff' : '#c9c9c9');
+    }
+    if (!sel && selected && sleepers.has(selected) && $('tSleep').checked) {
+      const p = sleepers.get(selected); sel = [p, w2s(p.x, p.z)];
+    }
+    if (sel) drawMarker(sel[0], sel[1], true, true);
+  }
+  let lastStatic = 0, lastStaticMs = 0, lastFrameMs = 0, lastPlayersMs = 0;
+  function drawStatic(now) {
+    const t0 = performance.now();
+    g = lctx;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    if (mapImg) {
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(mapImg, view.ox, view.oy, mapImg.naturalWidth * view.s, mapImg.naturalHeight * view.s);
+      if ($('tGrid').checked) drawGrid();
+      if ($('tBases').checked) drawBases();
+      if ($('tMon').checked) drawMonuments();
+      if ($('tSleep').checked) drawSleepers();
+      if ($('tDeaths').checked) drawDeaths();
+      if ($('tTrails').checked) drawTrails();
+    }
+    g = ctx;
+    staticDirty = false; lastStatic = now;
+    lastStaticMs = performance.now() - t0;
   }
   function draw(now) {
-    const r = wrap.getBoundingClientRect();
-    ctx.clearRect(0, 0, r.width, r.height);
+    const t0 = performance.now();
+    if (staticDirty) drawStatic(now);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (layer.width && layer.height) ctx.drawImage(layer, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     if (!mapImg) return;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(mapImg, view.ox, view.oy, mapImg.naturalWidth * view.s, mapImg.naturalHeight * view.s);
-    if ($('tGrid').checked) drawGrid(r);
-    if ($('tBases').checked) drawBases();
-    if ($('tMon').checked) drawMonuments();
-    if ($('tTrails').checked) drawTrails();
-    if ($('tDeaths').checked) drawDeaths();
-    drawPlayers(now);
+    g = ctx;
+    const t1 = performance.now();
+    if ($('tTrails').checked) drawTrailTails(now);
+    drawOnline(now);
+    lastPlayersMs = performance.now() - t1;
+    lastFrameMs = performance.now() - t0;
   }
-  let lastSlowDraw = 0;
+  let lastDraw = 0;
   function loop(now) {
+    requestAnimationFrame(loop); // first, so one bad frame never stops the map
     let moving = false;
-    for (const e of players.values()) if (now - e.t0 < POLL_MS && (e.fromX !== e.toX || e.fromZ !== e.toZ)) moving = true;
-    if (follow && selected && moving) centerOn(selected, false);
-    // fading trails/deaths change slowly: redraw at least every 5 s
-    if (dirty || moving || now - lastSlowDraw > 5000) { draw(now); dirty = false; lastSlowDraw = now; }
+    for (const e of online.values()) if (now - e.t0 < POLL_MS && (e.fromX !== e.toX || e.fromZ !== e.toZ)) { moving = true; break; }
+    if (follow && selected && moving && online.has(selected)) centerOn(selected, false);
+    if (now - lastStatic > STATIC_REFRESH_MS) staticDirty = true; // fading deaths and trails
+    // busy servers: animate movement at about 15 frames a second to spare the computer
+    const gap = online.size > 100 ? 66 : 0;
+    if (dirty || staticDirty || (moving && now - lastDraw >= gap)) { draw(now); dirty = false; lastDraw = now; }
+    if (listDirty && now - lastListRender > 1000) renderList();
+    if (eventsDirty) renderEvents();
+    if (chatDirty) renderChat();
     footer();
-    requestAnimationFrame(loop);
   }
   let lastFoot = '';
   function footer() {
@@ -800,10 +1090,10 @@
     if (lastData) {
       const age = Math.round((Date.now() - lastUpdate) / 1000);
       const h = lastData.hour, hh = Math.floor(h), mm = Math.floor((h - hh) * 60);
-      const online = lastData.players.filter(p => p.status !== 'sleeping').length;
-      t = online + ' online · ' + (lastData.players.length - online) + ' sleeping · in-game ' +
+      t = fmt(online.size) + ' online · ' + fmt(sleeperCount) + ' sleeping · in-game ' +
         String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') +
-        ' · updated ' + (age <= 3 ? 'just now' : age + 's ago');
+        ' · updated ' + (age <= 3 ? 'just now' : age + 's ago') +
+        (basesProgress && $('tBases').checked ? ' · ' + basesProgress : '');
     }
     if (t !== lastFoot) { $('foot').innerHTML = t; lastFoot = t; }
   }
@@ -820,7 +1110,7 @@
     if (drag) {
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 3) { wrap.classList.add('dragging'); follow = false; }
-      view.ox = drag.ox + dx; view.oy = drag.oy + dy; dirty = true;
+      view.ox = drag.ox + dx; view.oy = drag.oy + dy; viewChanged();
     }
     hoverInfo(e);
   });
@@ -831,14 +1121,17 @@
     const r = wrap.getBoundingClientRect();
     zoomAt(e.deltaY < 0 ? 1.2 : 1 / 1.2, e.clientX - r.left, e.clientY - r.top);
   }, { passive: false });
-  function zoomCenter(f) { const r = wrap.getBoundingClientRect(); zoomAt(f, r.width / 2, r.height / 2); }
+  function zoomCenter(f) { zoomAt(f, W / 2, H / 2); }
   $('zin').onclick = () => zoomCenter(1.5);
   $('zout').onclick = () => zoomCenter(1 / 1.5);
   $('zfit').onclick = () => { follow = false; fit(); };
-  for (const k of TOGGLES) $(k).onchange = () => { saveSettings(); dirty = true; };
-  $('trailLen').onchange = () => { saveSettings(); dirty = true; };
+  for (const k of TOGGLES) $(k).onchange = () => {
+    saveSettings(); viewChanged(); listDirty = true;
+    if (k === 'tBases' && $(k).checked) askBases();
+  };
+  $('trailLen').onchange = () => { saveSettings(); viewChanged(); };
 
-  // tooltip: grid square, plus any death marker or base under the mouse
+  // tooltip: grid square, plus any player, death marker or base under the mouse
   function hoverInfo(e) {
     const h = $('hover');
     if (!mapImg) { h.style.display = 'none'; return; }
@@ -847,16 +1140,29 @@
     const inner = mapImg.naturalWidth - 2 * mapInfo.margin, k = mapInfo.size / inner, half = mapInfo.size / 2;
     const wx = (ix - mapInfo.margin) * k - half, wz = half - (iy - mapInfo.margin) * k;
     if (Math.abs(wx) > half || Math.abs(wz) > half) { h.style.display = 'none'; return; }
-    const col = Math.floor((wx + half) / mapInfo.cell), row = Math.floor((half - wz) / mapInfo.cell);
     h.innerHTML = '';
-    const line = (text, cls) => { const d = document.createElement('div'); d.textContent = text; if (cls) d.className = cls; h.appendChild(d); };
-    line(gridName(col) + row, 'g');
-    const near = metersToPx(1);
+    const lines = [];
+    const line = (text, cls) => {
+      if (lines.length >= 8) return;
+      const d = document.createElement('div'); d.textContent = text; if (cls) d.className = cls; h.appendChild(d); lines.push(d);
+    };
+    line(gridOf(wx, wz), 'g');
+    const near = metersToPx(1), now = performance.now();
+    for (const en of online.values()) {
+      const pos = currentPos(en, now);
+      if (Math.hypot(wx - pos[0], wz - pos[1]) * near < 10) {
+        const p = en.data;
+        line(p.name + ' · ' + (p.status === 'dead' ? 'dead' : Math.round(p.health) + ' hp') + (p.mounted ? ' · in ' + prettyVehicle(p.mounted) : ''));
+      }
+    }
+    if ($('tSleep').checked) {
+      for (const p of sleepers.values()) if (Math.hypot(wx - p.x, wz - p.z) * near < 7) line(p.name + ' · sleeping (offline)');
+    }
     if ($('tDeaths').checked) {
-      const now = serverNow();
+      const t = serverNow();
       for (const x of deaths) {
-        if (now - x.time > DEATH_SHOW_SECONDS) continue;
-        if (Math.hypot(wx - x.x, wz - x.z) * near < 14) line('☠ ' + deathText(x) + ' · ' + ago(now - x.time));
+        if (t - x.time > DEATH_SHOW_SECONDS) continue;
+        if (Math.hypot(wx - x.x, wz - x.z) * near < 14) line('☠ ' + deathText(x) + ' · ' + ago(t - x.time));
       }
     }
     if ($('tBases').checked) {
@@ -864,13 +1170,21 @@
       for (const b of bases) {
         if (b.extraTc) continue;
         if (wx < b.minX - pad || wx > b.maxX + pad || wz < b.minZ - pad || wz > b.maxZ + pad) continue;
-        const auth = b.auth.filter(a => isSteamId(a.id)).map(a => a.name);
-        line((b.playerOwned ? 'Base of ' + (b.owner || '?') : 'Unowned / event base') + ' · ' + b.blocks + ' building blocks' +
-          (auth.length ? ' · cupboard access: ' + auth.join(', ') : ''));
+        line((b.playerOwned ? 'Base of ' + (b.owner || '?') : 'Unowned / event base') + ' · ' +
+          (b.blocks < 0 ? 'size not measured yet' : b.blocks + ' building blocks') +
+          (b.authNames.length ? ' · cupboard access: ' + b.authNames.join(', ') : ''));
       }
     }
     h.style.left = Math.min(sx + 14, r.width - 330) + 'px'; h.style.top = (sy + 14) + 'px'; h.style.display = 'block';
   }
+
+  // For measuring the page on big servers: LiveMapDebug.drawNow() in the browser console
+  window.LiveMapDebug = {
+    drawNow() { staticDirty = true; const t = performance.now(); draw(performance.now()); return { totalMs: performance.now() - t, backgroundMs: lastStaticMs, playersMs: lastPlayersMs }; },
+    frameMs() { const t = performance.now(); draw(performance.now()); return { frameMs: performance.now() - t, playersMs: lastPlayersMs }; },
+    counts() { return { online: online.size, sleepers: sleepers.size, bases: bases.length, trails: trails.size, deaths: deaths.length, events: events.length }; },
+    renderListMs() { const t = performance.now(); renderList(); return performance.now() - t; }
+  };
 
   // Browsers block an https:// page from opening the plain ws:// connection that Rust's WebRCON uses.
   if (location.protocol === 'https:') {

@@ -19,7 +19,8 @@ You don't need a web server, a database or any other program. The page talks to 
 - **Live chat**, including team chat, with a box to reply to everyone as SERVER.
 - **Join, leave and death alerts** with pop-ups and optional sounds, plus an events list where a click jumps to the spot on the map.
 - **Server health**: FPS, entity count, memory use and uptime.
-- **Follow a player**: click a name and the map keeps them centred.
+- **Follow a player**: click a name and the map keeps them centred. A search box finds anyone by name or Steam ID.
+- **Built for big servers**: tested with 600 online players, 10,000 sleepers and 10,000 bases. See [Big servers](#big-servers).
 
 ## Requirements
 
@@ -35,7 +36,7 @@ You don't need a web server, a database or any other program. The page talks to 
 Copy `AdminLiveMap.cs` to your server's `oxide/plugins` folder. Oxide loads it automatically. Your server console should show:
 
 ```
-Loaded plugin Admin Live Map v1.0.0 by Guerisse
+Loaded plugin Admin Live Map v1.1.0 by Guerisse
 ```
 
 ### 2. Get the page
@@ -88,6 +89,7 @@ The commands only work from RCON and the server console. Players can't use them 
 | --- | --- |
 | `livemap.map` | Says whether the map image is ready |
 | `livemap.map rerender` | Draws the map image again, for example after a big map change. Allowed once every 5 minutes, because drawing pauses the server for a few seconds. Reload the page afterwards. |
+| `livemap.benchmark [online] [sleepers] [bases]` | Load test: builds every answer with made-up data (default 600 online, 10,000 sleepers, 10,000 bases) and shows the time and size of each, plus the numbers for your server right now. It pauses the server for about a third of a second. |
 
 ### Commands the page uses
 
@@ -95,9 +97,12 @@ These answer with JSON. You can send them over RCON yourself, for example to bui
 
 | Command | Answers with |
 | --- | --- |
-| `livemap.players` | All players (online and sleeping) and recent deaths |
-| `livemap.trails` | Recent movement of online players. Typed in the server console, it prints a short summary instead. |
-| `livemap.bases` | Tool cupboards, their owners and building sizes |
+| `livemap.players` | Online players, plus counters that tell the page when sleepers or deaths changed |
+| `livemap.sleepers` | Offline sleepers |
+| `livemap.deaths <id>` | Deaths newer than the given death number (`0` for all) |
+| `livemap.trails` | Recent movement of all players, thinned out on busy servers. Typed in the server console, it prints a short summary instead. |
+| `livemap.trails <steamid>` | One player's full trail |
+| `livemap.bases` | Tool cupboards, their owners, building sizes and who has access |
 | `livemap.mapdata` | The map image (about 1 MB of text) and monument names |
 
 The page also uses three built-in Rust commands: `serverinfo`, `chat.tail` and `say`.
@@ -113,16 +118,43 @@ The settings file is `oxide/config/AdminLiveMap.json`:
   "Trail point interval (seconds)": 5.0,
   "Trail minimum movement between points (metres)": 3.0,
   "Keep trails for (minutes)": 60,
-  "Keep deaths for (minutes)": 120
+  "Max trail points sent at once (older points are thinned out above this)": 20000,
+  "Keep deaths for (minutes)": 120,
+  "Max deaths kept": 500,
+  "Send sleepers to the page": true,
+  "Send bases to the page": true,
+  "Base scan time per step (milliseconds, 5 steps a second)": 2.0
 }
 ```
 
 - **Map image scale:** higher values give a sharper map, but a bigger image to send and a longer pause when it is drawn. 0.5 suits most maps.
-- **Trails:** are kept in memory only. A plugin reload or server restart clears them.
-- **Deaths:** are saved in `oxide/data/AdminLiveMap/deaths.json`, so they survive a restart.
+- **Trails:** are kept in memory only. A plugin reload or server restart clears them. When the page connects it gets all trails at once; above the point limit, every 2nd, 3rd... point is left out. The trail of a player you click is always sent in full.
+- **Deaths:** are saved in `oxide/data/AdminLiveMap/deaths.json`, so they survive a restart. Only the newest ones are kept, up to the maximum.
+- **Send sleepers / Send bases:** set to `false` to switch those layers off completely.
+- **Base scan time per step:** how long the plugin may spend measuring building sizes, five times a second. Lower is gentler on the server; a full pass then takes longer.
 - **Map image:** is cached in `oxide/data/AdminLiveMap/map.json` (about 1 MB) and replaced automatically when the map changes.
 
 Reload the plugin after changing the file.
+
+## Big servers
+
+The plugin and the page are built so the work grows gently with server size.
+
+- **Only what changed:** every 2 seconds the page asks for online players only. Sleepers are sent when someone falls asleep or wakes up (at most once a minute per page), and deaths only when there is a new one.
+- **Shared answers:** answers are kept for a short time and shared, so several open pages cost about the same as one.
+- **No pauses for bases:** building sizes are measured a few buildings at a time (2 ms, five times a second) and only while a page is open. On a huge server the first pass can take a few minutes; until then bases show as a box around the cupboard and the footer says "measuring bases ..%".
+- **Busy-server mode in the page:** with more than 30 players online, joins, leaves, deaths and chat no longer pop up or beep (they are still listed). With more than 50, only the selected player's trail is drawn; with more than 60, names appear when you zoom in. Thousands of sleepers and bases are drawn as small squares when zoomed out.
+
+Load test results on a test server (`livemap.benchmark`, made-up data, server time to build one answer):
+
+| Answer | How often | 600 online, 10,000 sleepers, 10,000 bases | 250 online, 3,000 sleepers, 3,000 bases |
+| --- | --- | --- | --- |
+| Online players | every 2 s (shared for 1 s) | 1.2 ms, 50 KB | 0.5 ms, 21 KB |
+| Sleepers | when changed, at most once a minute | 7.5 ms, 569 KB | 2.1 ms, 170 KB |
+| All trails | once when the page connects | 8.3 ms, 430 KB | 7.6 ms, 418 KB |
+| Bases | every 60 s (shared for 30 s) | 22.5 ms, 1.4 MB | 6.4 ms, 441 KB |
+
+Run `livemap.benchmark` on your own server to see its numbers.
 
 ## Security
 
