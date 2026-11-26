@@ -80,17 +80,25 @@ Tick **Remember on this computer** to skip typing the password next time. It is 
 
 ## Console commands
 
-The page uses these commands. You can also type them in the server console or send them over RCON yourself. Each one answers with JSON.
-
 The commands only work from RCON and the server console. Players can't use them from the in-game F1 console, because the answers reveal every player's position and base. So there are no permissions to set up.
+
+### Commands for you
+
+| Command | What it does |
+| --- | --- |
+| `livemap.map` | Says whether the map image is ready |
+| `livemap.map rerender` | Draws the map image again, for example after a big map change. Allowed once every 5 minutes, because drawing pauses the server for a few seconds. Reload the page afterwards. |
+
+### Commands the page uses
+
+These answer with JSON. You can send them over RCON yourself, for example to build your own tools.
 
 | Command | Answers with |
 | --- | --- |
 | `livemap.players` | All players (online and sleeping) and recent deaths |
-| `livemap.trails` | Recent movement of online players |
+| `livemap.trails` | Recent movement of online players. Typed in the server console, it prints a short summary instead. |
 | `livemap.bases` | Tool cupboards, their owners and building sizes |
-| `livemap.map` | The map image and monument names |
-| `livemap.map rerender` | Draws the map image again (for example after a big map change) |
+| `livemap.mapdata` | The map image (about 1 MB of text) and monument names |
 
 The page also uses three built-in Rust commands: `serverinfo`, `chat.tail` and `say`.
 
@@ -112,6 +120,7 @@ The settings file is `oxide/config/AdminLiveMap.json`:
 - **Map image scale:** higher values give a sharper map, but a bigger image to send and a longer pause when it is drawn. 0.5 suits most maps.
 - **Trails:** are kept in memory only. A plugin reload or server restart clears them.
 - **Deaths:** are saved in `oxide/data/AdminLiveMap/deaths.json`, so they survive a restart.
+- **Map image:** is cached in `oxide/data/AdminLiveMap/map.json` (about 1 MB) and replaced automatically when the map changes.
 
 Reload the plugin after changing the file.
 

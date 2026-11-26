@@ -230,7 +230,7 @@
       $('connBox').style.display = 'none';
       $('discBtn').style.display = 'block';
       showMsg(mapImg ? '' : 'Loading map image...');
-      if (!mapImg) send('livemap.map', ID.map);
+      if (!mapImg) send('livemap.mapdata', ID.map);
       send('livemap.trails', ID.trails);
       send('chat.tail 50', ID.chatTail);
       const poll = () => send('livemap.players', ID.players);
