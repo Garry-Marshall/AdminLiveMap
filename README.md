@@ -82,6 +82,8 @@ Tick **Remember on this computer** to skip typing the password next time. It is 
 
 The page uses these commands. You can also type them in the server console or send them over RCON yourself. Each one answers with JSON.
 
+The commands only work from RCON and the server console. Players can't use them from the in-game F1 console, because the answers reveal every player's position and base. So there are no permissions to set up.
+
 | Command | Answers with |
 | --- | --- |
 | `livemap.players` | All players (online and sleeping) and recent deaths |
@@ -91,14 +93,6 @@ The page uses these commands. You can also type them in the server console or se
 | `livemap.map rerender` | Draws the map image again (for example after a big map change) |
 
 The page also uses three built-in Rust commands: `serverinfo`, `chat.tail` and `say`.
-
-## Permissions
-
-| Permission | Allows |
-| --- | --- |
-| `adminlivemap.use` | Using the `livemap.*` commands from the in-game F1 console |
-
-RCON and the server console can always use the commands. The page connects over RCON, so it needs no permission. Only grant `adminlivemap.use` to admins, because the commands show every player's position and base.
 
 ## Configuration
 
