@@ -483,7 +483,8 @@
     while (i > 0 && events[i - 1].time > time) i--;
     events.splice(i, 0, e);
     if (events.length > 300) events.shift();
-    if (isNew) {
+    // Game events are always kept, but stay out of sight (no line, pop-up or sound) while "Game events" is unticked.
+    if (isNew && !(kind === 'game' && !$('tGame').checked)) {
       if (!quiet || kind === 'game') { toast(kind, text); beep(kind); }
       if (activePane !== 'events') unread.events++;
     }
@@ -494,12 +495,14 @@
     $('evBadge').textContent = unread.events || '';
     if (activePane !== 'events') return;
     const box = $('pane-events');
-    if (!events.length) { box.innerHTML = '<div class="empty">Joins, leaves and deaths show up here.</div>'; return; }
+    const showGame = $('tGame').checked;
+    const shown = showGame ? events : events.filter(e => e.kind !== 'game');
+    if (!shown.length) { box.innerHTML = '<div class="empty">Joins, leaves and deaths show up here.</div>'; return; }
     const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
     box.innerHTML = '';
     const icons = { join: '▶', leave: '◀', death: '☠' };
     const frag = document.createDocumentFragment();
-    for (const e of events) {
+    for (const e of shown) {
       const el = document.createElement('div');
       el.className = 'ev ' + e.kind + (e.pos ? ' click' : '');
       el.innerHTML = '<span class="t"></span><span class="ic"></span><span class="tx"></span>';
@@ -1402,6 +1405,7 @@
     saveSettings(); viewChanged(); listDirty = true;
     if (k === 'tBases' && $(k).checked) askBases();
     if (k === 'tHeat') { if ($(k).checked) askHeat(); updateHeatKey(); }
+    if (k === 'tGame') { eventsDirty = true; if (!$(k).checked) for (const t of document.querySelectorAll('#toasts .game')) t.remove(); }
   };
   $('trailLen').onchange = () => { saveSettings(); viewChanged(); };
   for (const k of ['heatLayer', 'heatPeriod']) $(k).onchange = () => {
