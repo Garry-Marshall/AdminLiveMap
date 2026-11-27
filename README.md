@@ -22,6 +22,7 @@ You don't need a web server, a database or any other program. The page talks to 
 - **Join, leave and death alerts** with pop-ups and optional sounds, plus an events list where a click jumps to the spot on the map.
 - **Server health**: FPS, entity count, memory use and uptime.
 - **Follow a player**: click a name and the map keeps them centred. A search box finds anyone by name or Steam ID.
+- **Player card**: click a player in the list or on the map to see their status, health, vehicle, where they are, how long they have been online, their team, their bases (outlined on the map) and their kills and deaths in the last hour, with their Steam ID to copy.
 
 ## Requirements
 
@@ -37,7 +38,7 @@ You don't need a web server, a database or any other program. The page talks to 
 Copy `AdminLiveMap.cs` to your server's `oxide/plugins` folder. Oxide loads it automatically. Your server console should show:
 
 ```
-Loaded plugin Admin Live Map v1.2.0 by Guerisse
+Loaded plugin Admin Live Map v1.2.1 by Guerisse
 ```
 
 ### 2. Get the page
@@ -67,9 +68,10 @@ Tick **Remember on this computer** to skip typing the password next time. It is 
 | Zoom | Mouse wheel, or the **+** / **−** buttons |
 | Move around | Drag the map |
 | Show the whole map | The square button |
-| Follow a player | Click them in the player list. Click again to stop following. |
+| Follow a player | Click them in the player list or on the map. Their card opens at the bottom right. Click again, press **Esc** or the **✕** to close it. |
+| Player card | Shows status, health, vehicle, place, time online, team, bases and kills/deaths in the last hour. Click a team member, base or death to jump there. **Copy** copies the Steam ID. |
 | See details | Hover over the map: grid square, plus any base or death marker under the mouse |
-| Show or hide layers | The tick boxes: grid, monuments, sleepers, names, trails, deaths, bases, game events, sounds, heatmap |
+| Show or hide layers | The tick boxes: grid, monuments, sleepers, names, trails, deaths, bases, game events, sounds, heatmap. Unticking **Game events** also hides their lines in the Events tab and their pop-ups; tick it again to see them all. |
 | Heatmap | Tick **Heatmap**, then choose **Activity**, **All deaths** or **PvP kills**, and **Last hour**, **Last 24 hours** or **Since wipe**. Hover for the numbers; the key at the bottom left explains the colours. |
 | Jump to an event | Click a line in the **Events** tab |
 

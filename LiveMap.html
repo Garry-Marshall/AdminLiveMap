@@ -102,6 +102,28 @@
   #heatKey .bar { height: 9px; border-radius: 3px; margin: 5px 0 2px;
     background: linear-gradient(to right, rgba(40,60,255,.35), #2aa8ff, #33d17a, #ffd23f, #ff5a36); }
   #heatKey .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  /* player card: bottom right of the map while a player is selected */
+  #card { position: absolute; right: 12px; bottom: 12px; width: 300px; max-height: calc(100% - 150px); overflow-y: auto;
+    background: rgba(20,23,26,.95); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px;
+    display: none; cursor: default; }
+  #card.on { display: block; }
+  #card .hd { display: flex; align-items: center; gap: 8px; }
+  #card .sw { width: 12px; height: 12px; border-radius: 50%; flex: none; display: inline-block; }
+  #card .nm { font-weight: 600; font-size: 15px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #card .close { background: none; border: 0; color: var(--muted); font-size: 18px; padding: 0 2px; line-height: 1; }
+  #card .close:hover { color: var(--text); }
+  #card .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  #card .meta b { color: var(--text); font-weight: 600; }
+  #card .sid { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #card .btns { display: flex; gap: 6px; margin-top: 8px; }
+  #card h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 10px 0 3px; font-weight: 600; }
+  #card .it { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 5px; cursor: pointer; }
+  #card .it:hover { background: var(--panel2); }
+  #card .it .tx { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #card .it .gr { color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; font-size: 12px; }
+  #card .it .ago { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  #card .it.wrap .tx { white-space: normal; }
+  #card .more { color: var(--muted); font-size: 12px; padding: 2px 6px; }
 </style>
 </head>
 <body>
@@ -117,6 +139,7 @@
     <div id="msg">Fill in the server details on the right and press Connect.</div>
     <div id="hover"></div>
     <div id="heatKey"></div>
+    <div id="card"></div>
   </div>
 
   <aside id="side">
@@ -240,7 +263,7 @@
   let selected = null, follow = false;
   let view = { s: 0.3, ox: 0, oy: 0 }; // screen = img * s + o
   let W = 0, H = 0, dpr = 1;
-  let dirty = true, staticDirty = true, listDirty = true, chatDirty = false, eventsDirty = false;
+  let dirty = true, staticDirty = true, listDirty = true, chatDirty = false, eventsDirty = false, cardDirty = false;
 
   // ---------- saved settings (stay in this browser only) ----------
   try {
@@ -585,8 +608,9 @@
     quiet = d.online.length > QUIET_ABOVE;
     const now = performance.now(), seen = new Set();
     for (const r of d.online) {
-      // [steamId, name, x, z, heading, health, flags, teamId, vehicle]
-      const p = { id: r[0], name: r[1], x: r[2], z: r[3], heading: r[4], health: r[5], flags: r[6], team: r[7], mounted: r[8] };
+      // [steamId, name, x, z, heading, health, flags, teamId, vehicle, seconds connected]
+      const p = { id: r[0], name: r[1], x: r[2], z: r[3], heading: r[4], health: r[5], flags: r[6], team: r[7], mounted: r[8],
+        connected: typeof r[9] === 'number' ? r[9] : null };
       if (seen.has(p.id)) continue;
       seen.add(p.id);
       p.status = p.flags & 2 ? 'dead' : 'online';
@@ -608,7 +632,7 @@
       online.delete(id);
       if (!firstPlayers) addEvent('leave', e.data.name + ' left', d.now, [e.toX, e.toZ], true);
       // they now sleep where they were; the next sleepers update confirms it
-      sleepers.set(id, Object.assign({}, e.data, { x: e.toX, z: e.toZ, status: 'sleeping', heading: -1, mounted: null, asleep: false }));
+      sleepers.set(id, Object.assign({}, e.data, { x: e.toX, z: e.toZ, status: 'sleeping', heading: -1, mounted: null, asleep: false, connected: null }));
       sleepersSorted = null;
       staticDirty = true;
     }
@@ -625,7 +649,7 @@
 
     firstPlayers = false;
     lastData = d; lastUpdate = Date.now();
-    listDirty = true;
+    listDirty = true; cardDirty = true;
     if ($('tTrails').checked) staticDirty = true; // trails grew
     dirty = true;
     updateBusyNote();
@@ -640,7 +664,7 @@
       if (online.has(r[0])) continue;
       sleepers.set(r[0], { id: r[0], name: r[1], x: r[2], z: r[3], health: r[4], flags: r[5], team: r[6], status: 'sleeping', heading: -1 });
     }
-    sleepersSorted = null; listDirty = true; staticDirty = true;
+    sleepersSorted = null; listDirty = true; staticDirty = true; cardDirty = true;
   }
   function loadDeaths(d) {
     deathsPending = false;
@@ -653,7 +677,7 @@
     deathsLoaded = true;
     const cutoff = serverNow() - DEATH_SHOW_SECONDS;
     deaths = deaths.filter(x => x.time >= cutoff);
-    staticDirty = true;
+    staticDirty = true; cardDirty = true;
   }
   const DAMAGE_WORDS = { fall: 'fell to their death', bleeding: 'bled out', hunger: 'starved', thirst: 'died of thirst',
     cold: 'froze to death', heat: 'burned to death', drowned: 'drowned', radiationexposure: 'died of radiation',
@@ -756,7 +780,7 @@
     basesProgress = basesComplete || !d.total ? '' : 'measuring bases ' + Math.floor(100 * d.measured / d.total) + '%';
     clearTimeout(basesTimer); basesTimer = null;
     if (!basesComplete) basesTimer = setTimeout(askBases, BASES_SCAN_MS); // sizes still being measured
-    listDirty = true; staticDirty = true;
+    listDirty = true; staticDirty = true; cardDirty = true;
   }
 
   // ---------- game events ----------
@@ -1045,16 +1069,148 @@
       el.querySelector('.nm').textContent = p.name;
       el.querySelector('.gr').textContent = gridOf(p.x, p.z);
       el.querySelector('.sub').textContent = parts.join(' · ');
-      el.onclick = () => {
-        if (selected === p.id) { follow = false; selected = null; }
-        else { selected = p.id; follow = online.has(p.id); centerOn(p.id, true); askFullTrail(p.id); }
-        renderList(); viewChanged();
-      };
+      el.onclick = () => select(selected === p.id ? null : p.id, true);
       frag.appendChild(el);
     }
     box.appendChild(frag);
   }
   $('search').addEventListener('input', renderList);
+  // select a player (null = nobody): highlights them, follows them if online and opens their card
+  function select(id, zoomIn) {
+    if (!id) { selected = null; follow = false; }
+    else { selected = id; follow = online.has(id); centerOn(id, zoomIn); askFullTrail(id); }
+    renderList(); viewChanged(); cardDirty = true;
+  }
+
+  // ---------- player card ----------
+  const CARD_ROWS = 6; // rows per card section before "and N more"
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
+  function duration(sec) {
+    const m = Math.floor(sec / 60);
+    return m < 1 ? 'less than a minute' : m < 60 ? m + ' min' : Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+  }
+  function statusText(p) {
+    return p.status === 'online' ? (p.asleep ? 'Online (still asleep)' : 'Online') : p.status === 'dead' ? 'Dead' : 'Sleeping (offline)';
+  }
+  function cardSection(el, html) { if (el._html !== html) { el._html = html; el.innerHTML = html; } }
+  function cardEl() {
+    // built once; every part is only replaced when its text changed, so clicks don't get lost
+    const c = $('card');
+    if (!c._built) {
+      c.innerHTML = '<div class="hd"><span class="sw"></span><span class="nm"></span><button class="close" data-act="close" title="Close (Esc)">✕</button></div>' +
+        '<div class="meta" id="cMeta"></div><div class="sid" id="cSid"></div><div class="btns" id="cBtns"></div>' +
+        '<div id="cTeam"></div><div id="cBases"></div><div id="cDeaths"></div>';
+      c._built = true;
+    }
+    return c;
+  }
+  function renderCard() {
+    cardDirty = false;
+    const c = cardEl(), p = selected && playerData(selected);
+    if (!p) { c.classList.remove('on'); return; }
+    c.classList.add('on');
+    const col = colorFor(p.team, p.id), sw = c.querySelector('.hd .sw');
+    sw.style.background = p.status === 'online' ? col : 'transparent';
+    sw.style.border = '2px solid ' + (p.status === 'dead' ? 'var(--bad)' : col);
+    c.querySelector('.hd .nm').textContent = p.name;
+
+    // status, health, vehicle, place and time online
+    const bits = ['<b>' + esc(statusText(p)) + '</b>'];
+    if (p.status !== 'dead') bits.push(Math.round(p.health) + ' hp');
+    if (p.mounted) bits.push('in ' + esc(prettyVehicle(p.mounted)));
+    let meta = bits.join(' · ') + '<br>' + esc(placeName(p.x, p.z));
+    if (online.has(p.id) && p.connected != null) meta += '<br>Online for ' + duration(p.connected);
+    cardSection($('cMeta'), meta);
+
+    cardSection($('cSid'), isSteamId(p.id)
+      ? 'Steam ID ' + esc(p.id) + ' <button class="ghost small" data-act="copy" title="Copy the Steam ID">Copy</button>' : '');
+    cardSection($('cBtns'), online.has(p.id)
+      ? '<button class="ghost small" data-act="follow">' + (follow ? 'Stop following' : 'Follow') + '</button>'
+      : '<button class="ghost small" data-act="center">Show on map</button>');
+
+    // team members, online first
+    let team = '';
+    if (p.team) {
+      const members = [];
+      for (const e of online.values()) if (e.data.team === p.team && e.data.id !== p.id) members.push(e.data);
+      for (const s of sleepers.values()) if (s.team === p.team && s.id !== p.id) members.push(s);
+      members.sort(byStatusName);
+      const leader = teamLeaders[p.team];
+      team = '<h4>Team' + (leader === p.id ? ' (leader)' : '') + '</h4>';
+      if (!members.length) team += '<div class="more">Nobody else in the team.</div>';
+      for (const m of members.slice(0, CARD_ROWS * 2)) {
+        const mc = colorFor(m.team, m.id);
+        const swStyle = 'background:' + (m.status === 'online' ? mc : 'transparent') + ';border:2px solid ' + (m.status === 'dead' ? 'var(--bad)' : mc);
+        team += '<div class="it" data-sel="' + esc(m.id) + '" title="' + esc(statusText(m)) + '"><span class="sw" style="' + swStyle + '"></span>' +
+          '<span class="tx">' + esc(m.name) + (m.id === leader ? ' ★' : '') + '</span><span class="gr">' + esc(gridOf(m.x, m.z)) + '</span></div>';
+      }
+      if (members.length > CARD_ROWS * 2) team += '<div class="more">and ' + (members.length - CARD_ROWS * 2) + ' more</div>';
+    }
+    cardSection($('cTeam'), team);
+
+    // bases they own, then bases where they have cupboard access
+    let bh = '';
+    if ($('tBases').checked) {
+      const own = [], authed = [];
+      for (const b of bases) {
+        if (b.extraTc || !b.playerOwned) continue;
+        if (b.ownerId === p.id) own.push(b); else if (b.auth.includes(p.id)) authed.push(b);
+      }
+      if (own.length || authed.length) {
+        bh = '<h4>Bases (' + own.length + ' own' + (authed.length ? ', ' + authed.length + ' with access' : '') + ')</h4>';
+        const rows = own.concat(authed);
+        for (const b of rows.slice(0, CARD_ROWS)) {
+          const what = b.ownerId === p.id ? 'own base' : 'access to ' + (b.owner || 'a base');
+          const size = b.blocks > 0 ? ' · ' + fmt(b.blocks) + ' blocks' : '';
+          bh += '<div class="it" data-go="' + b.x + ',' + b.z + '"><span class="sw" style="border-radius:2px;background:' + b.color + '"></span>' +
+            '<span class="tx">' + esc(what) + size + '</span><span class="gr">' + esc(gridOf(b.x, b.z)) + '</span></div>';
+        }
+        if (rows.length > CARD_ROWS) bh += '<div class="more">and ' + (rows.length - CARD_ROWS) + ' more (outlined on the map)</div>';
+      }
+    }
+    cardSection($('cBases'), bh);
+
+    // kills and deaths in the last hour, newest first
+    let dh = '';
+    const mine = deaths.filter(x => x.victimId === p.id || x.killerId === p.id).sort((a, b) => b.time - a.time);
+    if (mine.length) {
+      const kills = mine.filter(x => x.killerId === p.id && x.victimId !== p.id).length, died = mine.length - kills;
+      dh = '<h4>Last hour: ' + kills + (kills === 1 ? ' kill' : ' kills') + ', ' + died + (died === 1 ? ' death' : ' deaths') + '</h4>';
+      const now = serverNow();
+      for (const x of mine.slice(0, CARD_ROWS)) {
+        const killed = x.killerId === p.id && x.victimId !== p.id;
+        const text = killed ? '⚔ Killed ' + x.victim + (x.weapon ? ' (' + x.weapon + (x.distance > 1 ? ', ' + x.distance + ' m' : '') + ')' : '') : '☠ ' + deathText(x).replace(/ in \S+$/, '');
+        dh += '<div class="it wrap" data-go="' + x.x + ',' + x.z + '"><span class="tx">' + esc(text) + '</span><span class="ago">' + ago(now - x.time) + '</span></div>';
+      }
+      if (mine.length > CARD_ROWS) dh += '<div class="more">and ' + (mine.length - CARD_ROWS) + ' more</div>';
+    }
+    cardSection($('cDeaths'), dh);
+  }
+  function copyText(text, btn) {
+    const done = () => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); };
+    if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done, () => fallback()); return; }
+    fallback();
+    function fallback() {
+      const t = document.createElement('textarea'); t.value = text; t.style.position = 'fixed'; t.style.opacity = '0';
+      document.body.appendChild(t); t.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      t.remove();
+    }
+  }
+  $('card').addEventListener('click', e => {
+    const t = e.target.closest('[data-act],[data-sel],[data-go]');
+    if (!t) return;
+    if (t.dataset.sel) { select(t.dataset.sel, false); return; }
+    if (t.dataset.go) { const [x, z] = t.dataset.go.split(',').map(Number); follow = false; centerOnWorld(x, z, true); cardDirty = true; return; }
+    const act = t.dataset.act;
+    if (act === 'close') select(null);
+    else if (act === 'copy') copyText(selected, t);
+    else if (act === 'follow') { follow = !follow; if (follow) centerOn(selected, false); cardDirty = true; }
+    else if (act === 'center') centerOn(selected, true);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && selected && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) select(null);
+  });
   function prettyVehicle(s) {
     return s.replace(/\.entity$/, '').replace(/[._]/g, ' ').replace(/\b(seat|driver|passenger)\b/g, '').trim();
   }
@@ -1128,8 +1284,11 @@
       if (p2[0] < -60 || p1[0] > W + 60 || p2[1] < -60 || p1[1] > H + 60) continue;
       let w = p2[0] - p1[0], h = p2[1] - p1[1];
       const cx = (p1[0] + p2[0]) / 2, cy = (p1[1] + p2[1]) / 2;
-      if (many && w < 8 && h < 8) { if (!b.extraTc) bucket(small, b.color, [cx, cy]); continue; }
+      // the selected player's bases (owned or with cupboard access) get a white outline
+      const mineSel = selected && b.playerOwned && (b.ownerId === selected || b.auth.includes(selected));
+      if (many && w < 8 && h < 8 && !mineSel) { if (!b.extraTc) bucket(small, b.color, [cx, cy]); continue; }
       if (w < 8) w = 8; if (h < 8) h = 8;
+      if (mineSel) { g.globalAlpha = 1; g.strokeStyle = '#fff'; g.lineWidth = 2; g.strokeRect(cx - w / 2 - 4, cy - h / 2 - 4, w + 8, h + 8); }
       g.globalAlpha = 0.22; g.fillStyle = b.color; g.fillRect(cx - w / 2, cy - h / 2, w, h);
       g.globalAlpha = 0.95; g.strokeStyle = b.color; g.lineWidth = 2;
       if (!b.playerOwned) g.setLineDash([4, 3]);
@@ -1357,6 +1516,7 @@
     if (dirty || staticDirty || (moving && now - lastDraw >= gap)) { draw(now); dirty = false; lastDraw = now; }
     if (listDirty && now - lastListRender > 1000) renderList();
     if (eventsDirty) renderEvents();
+    if (cardDirty) renderCard();
     if (chatDirty) renderChat();
     footer();
   }
@@ -1378,21 +1538,41 @@
   // ---------- mouse ----------
   let drag = null;
   wrap.addEventListener('pointerdown', e => {
-    if (e.target.closest('#zoomBtns')) return;
-    drag = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy };
+    if (e.target.closest('#zoomBtns, #card')) return;
+    drag = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy, moved: false };
     wrap.setPointerCapture(e.pointerId);
   });
   wrap.addEventListener('pointermove', e => {
     if (drag) {
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-      if (Math.abs(dx) + Math.abs(dy) > 3) { wrap.classList.add('dragging'); follow = false; }
+      if (Math.abs(dx) + Math.abs(dy) > 3) { wrap.classList.add('dragging'); if (follow) { follow = false; cardDirty = true; } drag.moved = true; }
       view.ox = drag.ox + dx; view.oy = drag.oy + dy; viewChanged();
     }
+    if (!drag && e.target.closest('#card')) { $('hover').style.display = 'none'; return; }
     hoverInfo(e);
   });
-  wrap.addEventListener('pointerup', () => { drag = null; wrap.classList.remove('dragging'); });
+  wrap.addEventListener('pointerup', e => {
+    // a click (not a drag) on a player opens their card
+    if (drag && !drag.moved) { const id = playerAt(e); if (id) select(id === selected ? null : id, false); }
+    drag = null; wrap.classList.remove('dragging');
+  });
   wrap.addEventListener('pointerleave', () => { $('hover').style.display = 'none'; });
+  function playerAt(e) {
+    if (!mapImg) return null;
+    const r = wrap.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, now = performance.now();
+    let best = null, bestD = 12;
+    for (const en of online.values()) {
+      const pos = currentPos(en, now), sp = w2s(pos[0], pos[1]), d = Math.hypot(sp[0] - sx, sp[1] - sy);
+      if (d < bestD) { bestD = d; best = en.data.id; }
+    }
+    if (!best && $('tSleep').checked) for (const p of sleepers.values()) {
+      const sp = w2s(p.x, p.z), d = Math.hypot(sp[0] - sx, sp[1] - sy);
+      if (d < bestD) { bestD = d; best = p.id; }
+    }
+    return best;
+  }
   wrap.addEventListener('wheel', e => {
+    if (e.target.closest('#card')) return; // scroll the card, not the map
     e.preventDefault();
     const r = wrap.getBoundingClientRect();
     zoomAt(e.deltaY < 0 ? 1.2 : 1 / 1.2, e.clientX - r.left, e.clientY - r.top);

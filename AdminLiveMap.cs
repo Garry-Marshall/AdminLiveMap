@@ -9,7 +9,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("Admin Live Map", "Guerisse", "1.2.0")]
+    [Info("Admin Live Map", "Guerisse", "1.2.1")]
     [Description("Feeds the Admin Live Map web page over RCON: players, trails, deaths, bases and the map image")]
     public class AdminLiveMap : RustPlugin
     {
@@ -110,6 +110,7 @@ namespace Oxide.Plugins
             public string Name, Mounted;
             public float X, Z, Heading, Health;
             public int Flags; // 1 = connected but not woken up yet, 2 = dead
+            public int Connected; // seconds since this player connected
         }
 
         private struct BaseSnap
@@ -382,7 +383,8 @@ namespace Oxide.Plugins
                     Health = p.health,
                     Flags = (p.IsSleeping() ? 1 : 0) | (dead ? 2 : 0),
                     Team = TeamOf(p, leaders),
-                    Mounted = mounted
+                    Mounted = mounted,
+                    Connected = p.Connection != null ? (int)p.Connection.GetSecondsConnected() : 0
                 });
             }
         }
@@ -430,7 +432,7 @@ namespace Oxide.Plugins
             sb.Append(",\"lastDeath\":"); Int(sb, lastDeath);
             sb.Append(',');
             Teams(sb, leaders);
-            // Each player: [steamId, name, x, z, heading (-1 = none), health, flags, teamId, vehicle]
+            // Each player: [steamId, name, x, z, heading (-1 = none), health, flags, teamId, vehicle, seconds connected]
             sb.Append(",\"online\":[");
             for (int i = 0; i < online.Count; i++)
             {
@@ -445,6 +447,7 @@ namespace Oxide.Plugins
                 sb.Append(','); Int(sb, s.Flags);
                 sb.Append(','); Id(sb, s.Team);
                 sb.Append(','); Str(sb, s.Mounted);
+                sb.Append(','); Int(sb, s.Connected);
                 sb.Append(']');
             }
             sb.Append(']');
@@ -1369,7 +1372,8 @@ namespace Oxide.Plugins
                 {
                     Id = baseId + (ulong)i, Name = "Test player \"" + i + "\"", X = pos(), Z = pos(),
                     Heading = rnd.Next(360), Health = rnd.Next(1, 100), Team = team,
-                    Mounted = rnd.Next(10) == 0 ? "minicopter.entity" : null
+                    Mounted = rnd.Next(10) == 0 ? "minicopter.entity" : null,
+                    Connected = rnd.Next(4 * 3600)
                 });
             }
             var sleeperSnaps = new List<PlayerSnap>(sleepers);
